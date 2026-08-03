@@ -4,6 +4,7 @@ Backend for the Kingdom Sponsor fundraising platform: Cloudflare Worker + D1 (SQ
 
 - **Backend repo**: https://github.com/Carpso/chisomo
 - **Flutter app repo**: https://github.com/Carpso/chisomo_flutter
+- **Privacy Policy**: https://github.com/Carpso/chisomo/blob/master/PRIVACY_POLICY.md
 
 ## Quick start (local dev)
 
