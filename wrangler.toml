@@ -1,0 +1,49 @@
+name = "kingdom-sponsor-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+workers_dev = true
+compatibility_flags = ["nodejs_compat"]
+
+# Sweep accumulated donation platform fees to SETTLEMENT_PHONE daily at 02:00 UTC.
+[triggers]
+crons = ["0 2 * * *"]
+
+# DB. For remote deploy, replace database_id with the one from:
+#   npx wrangler d1 create kingdom-sponsor-db
+[[d1_databases]]
+binding = "DB"
+database_name = "kingdom-sponsor-db"
+database_id = "01c99f57-3f1b-4212-85db-261f86f90a24"
+
+# Campaign branding media (logos). Public images are served via /media/:key.
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "kingdom-sponsor-media"
+
+# Secrets (set with: npx wrangler secret put NAME):
+#   LIPILA_API_KEY       - Lipila live/secret key (lsk_/lpk_)
+#   LIPILA_WEBHOOK_SECRET- shared secret sent by Lipila callbacks (verify in webhook handler)
+#   JWT_SECRET           - random string for signing user tokens
+#   AT_USERNAME          - Africa's Talking username
+#   AT_API_KEY           - Africa's Talking API key
+#   SUPERADMIN_PHONES    - comma-separated superadmin phone numbers (international format)
+#   SETTLEMENT_PHONE     - number where Kingdom Sponsor's fee earnings are disbursed
+#
+# Vars (plain config, change freely). NOTE: in production, `wrangler secret put`
+# with the same name overrides a var - so these placeholders are dev-only defaults.
+[vars]
+ENV = "sandbox"                 # SMS + OTP debug mode: "sandbox" shows debug code in API, "production" requires real AT creds
+LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
+APP_URL = "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev"
+PLATFORM_FEE_PCT = "1"          # your cut per donation (%), Kingdom Sponsor keeps 1% above the minimum
+PLATFORM_MIN_FEE_CENTS = "300"  # flat minimum platform fee per donation (K3)
+LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila MoMo collection fee (%) -> customer pays 3.5% total on MoMo
+LIPILA_DISBURSEMENT_FEE_PCT = "1.5" # Lipila MoMo disbursement fee (%), deducted at payout
+OTP_TTL_MINUTES = "5"
+PROMO_PRICE_CENTS = "15000"     # cost of a promoted (top-5) slot per purchase: K150
+PROMO_DAYS = "7"                # how long a promotion stays live
+# AT_FROM = "KSPONSO"  # registered AT sender ID / shortcode for production SMS (empty = AT default)
+# All secret values (JWT_SECRET, LIPILA_API_KEY, LIPILA_WEBHOOK_SECRET, AT_USERNAME, AT_API_KEY,
+# SUPERADMIN_PHONES, SETTLEMENT_PHONE) live in .dev.vars for local dev and as production secrets
+# via `wrangler secret put` / `wrangler secret bulk`. They are intentionally NOT vars here:
+# a var with the same name blocks setting the secret, and secrets must never be committed.

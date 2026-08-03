@@ -1,0 +1,22 @@
+{
+  "name": "kingdom-sponsor-api",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Kingdom Sponsor - neutral fundraising platform backend (Cloudflare Worker + D1 + Lipila + Africa's Talking)",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "db:init": "wrangler d1 execute kingdom-sponsor-db --local --file=./sql/schema.sql",
+    "db:remote": "wrangler d1 execute kingdom-sponsor-db --remote --file=./sql/schema.sql",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.2.0",
+    "hono": "^4.6.0",
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.118.0"
+  }
+}
