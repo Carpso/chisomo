@@ -1,6 +1,9 @@
 # Kingdom Sponsor API
 
-Backend for the Kingdom Sponsor fundraising platform (formerly Kingdom Sponsor): Cloudflare Worker + D1 (SQLite) + Lipila payments + Africa's Talking SMS.
+Backend for the Kingdom Sponsor fundraising platform: Cloudflare Worker + D1 (SQLite) + Lipila payments + Africa's Talking SMS + USSD.
+
+- **Backend repo**: https://github.com/Carpso/chisomo
+- **Flutter app repo**: https://github.com/Carpso/chisomo_flutter
 
 ## Quick start (local dev)
 
