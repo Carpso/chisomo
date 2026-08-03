@@ -25,15 +25,17 @@ OTP responses include a `debugCode` you can use to log in without SMS.
    ```
 5. Set `APP_URL` in `wrangler.toml` to your deployed Worker URL. The webhook is `POST {APP_URL}/api/webhooks/lipila?secret=LIPILA_WEBHOOK_SECRET` — every collection and disbursement includes it, so you don't need to register it in the Lipila dashboard.
 
-### 2. Africa's Talking (OTP SMS)
+### 2. Africa's Talking (OTP SMS + USSD)
 1. Sign up at https://africastalking.com and create a sandbox app (production: create a live app, buy a shortcode or register a sender ID).
 2. Set secrets:
    ```powershell
    npx wrangler secret put AT_USERNAME   # your AT app username
    npx wrangler secret put AT_API_KEY
    ```
-3. Optional: set `AT_FROM` as a var in `wrangler.toml` if you have a registered sender ID/shortcode.
-4. Sandbox test numbers are e.g. `+254711XXXYYY` style numbers provided by AT.
+3. Set the USSD callback URL in your Africa's Talking dashboard to:
+   `https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev/api/ussd`
+4. Optional: set `AT_FROM` as a var in `wrangler.toml` if you have a registered sender ID/shortcode.
+5. Sandbox test numbers are e.g. `+254711XXXYYY` style numbers provided by AT.
 
 ### 3. Cloudflare D1 (database)
 ```powershell
@@ -89,6 +91,7 @@ After each confirmed donation, if the campaign's available balance ≥ `min_with
 | POST | /api/campaigns/:id/withdraw | Bearer (host) | Manual payout |
 | POST | /api/campaigns/:id/end | Bearer (host) | End + sweep balance |
 | GET | /api/host/me | Bearer | Host dashboard data |
+| POST | /api/ussd | – | Africa's Talking USSD webhook |
 | POST | /api/webhooks/lipila | ?secret= | Lipila callbacks |
 
 ## Notes
