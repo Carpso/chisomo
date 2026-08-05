@@ -110,6 +110,24 @@ async function smsIfNoPush(env: Bindings, userId: number | null, phone: string |
   await sendSms(env, phone, text).catch((e) => console.error("sms failed:", e));
 }
 
+/** Push-only alert to admins with the app installed (in-app notifications,
+ *  never SMS). Used for support tickets and similar non-urgent admin alerts. */
+async function pushAdmins(env: Bindings, title: string, body: string, data?: Record<string, string>): Promise<void> {
+  if (!envPushConfigured(env)) return;
+  const phones = (env.SUPERADMIN_PHONES ?? "").split(",").map((p) => p.trim()).filter(Boolean);
+  if (!phones.length) return;
+  const placeholders = phones.map(() => "?").join(",");
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT dt.token FROM device_tokens dt
+     JOIN users u ON u.id = dt.user_id
+     WHERE u.phone IN (${placeholders})`
+  ).bind(...phones).all<{ token: string }>();
+  const tokens = rows.results.map((r) => r.token);
+  if (!tokens.length) return;
+  await sendMulticastPush(fbEnv(env), tokens, title, body, data)
+    .catch((e) => console.error("admin push failed:", e));
+}
+
 /** Push to every user whose phone is on the superadmin list (used for urgent admin alerts). */
 async function pushAndSmsAdmins(env: Bindings, smsText: string, pushTitle: string, pushBody: string): Promise<void> {
   const phones = (env.SUPERADMIN_PHONES ?? "").split(",").map((p) => p.trim()).filter(Boolean);
@@ -1977,8 +1995,9 @@ app.post("/api/support/tickets", async (c) => {
   const ticketId = Number(r.meta.last_row_id);
 
   // Notify the superadmin(s) so tickets are answered fast.
-  await pushAndSmsAdmins(c.env, supportReceivedSms(ticketId, subject),
-    "New support request", `#${ticketId}: ${subject}`).catch(() => {});
+  await pushAdmins(c.env,
+    "New support request", `#${ticketId}: ${subject}`,
+    { type: "ticket_created", ticketId: String(ticketId) }).catch(() => {});
 
   return c.json({ ok: true, id: ticketId });
 });
@@ -2036,8 +2055,9 @@ app.post("/api/support/tickets/:id/reply", async (c) => {
     await c.env.DB.prepare(
       "UPDATE support_tickets SET message = ?, status = 'open', updated_at = datetime('now', '+2 hours') WHERE id = ?"
     ).bind(text, ticket.id).run();
-    await pushAndSmsAdmins(c.env, supportReceivedSms(ticket.id, `re: ${ticket.subject}`),
-      "Ticket reopened", `#${ticket.id}: ${ticket.subject}`).catch(() => {});
+    await pushAdmins(c.env,
+      "Ticket reopened", `#${ticket.id}: ${ticket.subject}`,
+      { type: "ticket_created", ticketId: String(ticket.id) }).catch(() => {});
   }
 
   return c.json({ ok: true });
