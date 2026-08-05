@@ -37,7 +37,7 @@ bucket_name = "kingdom-sponsor-media"
 [vars]
 ENV = "production"              # SMS + OTP mode: "sandbox" shows debug code in API, "production" sends real AT SMS
 AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (not user-facing; used in the AT API call)
-AT_FROM = "KSPONSO"             # registered AT sender ID / shortcode for production SMS (empty = AT default)
+AT_FROM = "KSPONSOR"             # registered AT sender ID / shortcode for production SMS (empty = AT default)
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
 APP_URL = "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev"
 PLATFORM_FEE_PCT = "1"          # your cut per donation (%), Kingdom Sponsor keeps 1% above the minimum
