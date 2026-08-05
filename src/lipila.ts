@@ -103,15 +103,25 @@ export async function checkCollectionStatus(env: LipilaEnv, referenceId: string)
   return { status: data.status, message: data.message, amount: data.amount };
 }
 
-/** Check status of a disbursement by referenceId. */
+/** Check status of a disbursement by referenceId (tries both documented paths). */
 export async function checkDisbursementStatus(env: LipilaEnv, referenceId: string): Promise<LipilaStatus> {
-  const res = await fetch(
+  const headers = { accept: "application/json", "x-api-key": env.LIPILA_API_KEY };
+  const paths = [
+    `${lipilaBase(env)}/disbursements/check-status?referenceId=${encodeURIComponent(referenceId)}`,
     `${lipilaBase(env)}/disbursements/status/${encodeURIComponent(referenceId)}`,
-    { headers: { accept: "application/json", "x-api-key": env.LIPILA_API_KEY } }
-  );
-  const data: any = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Lipila disbursement status check failed (${res.status}): ${JSON.stringify(data)}`);
-  return { status: data.status, message: data.message, amount: data.amount };
+  ];
+  let lastErr: Error | null = null;
+  for (const path of paths) {
+    try {
+      const res = await fetch(path, { headers });
+      const data: any = await res.json().catch(() => ({}));
+      if (res.ok) return { status: data.status, message: data.message, amount: data.amount };
+      lastErr = new Error(`Lipila disbursement status check failed (${res.status}): ${JSON.stringify(data)}`);
+    } catch (e) {
+      lastErr = e as Error;
+    }
+  }
+  throw lastErr ?? new Error("Lipila disbursement status check failed");
 }
 
 /** Current available wallet balance in kwacha. */

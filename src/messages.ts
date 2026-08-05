@@ -3,7 +3,9 @@
 
 export function kwacha(cents: number): string {
   const k = cents / 100;
-  return k % 1 === 0 ? `K${k.toLocaleString()}` : `K${k.toFixed(2)}`;
+  const [whole, frac] = k.toFixed(2).split(".");
+  const grouped = Number(whole).toLocaleString("en-US");
+  return frac === "00" ? `K${grouped}` : `K${grouped}.${frac}`;
 }
 
 export function campaignLink(campaignId: number | string): string {
@@ -69,4 +71,24 @@ export function supportReplySms(subject: string): string {
 /** Sent to superadmin phones when a new support ticket arrives. */
 export function supportReceivedSms(ticketId: number, subject: string): string {
   return `New support request #${ticketId}: "${subject}". Open the admin panel to reply. Kingdom Sponsor`;
+}
+
+/** Sent to the host when their promotion fee is refunded to mobile money. */
+export function promotionRefundedSms(campaignTitle: string, amountCents: number): string {
+  return `Your promotion payment of ${kwacha(amountCents)} for "${campaignTitle}" has been refunded to your mobile money. Kingdom Sponsor`;
+}
+
+/** Sent to the host when a paid promotion window ends (with a renew hint). */
+export function promotionExpiredSms(campaignTitle: string): string {
+  return `Your promotion for "${campaignTitle}" has ended. You can promote it again anytime in the app. Kingdom Sponsor`;
+}
+
+/** Sent to donors when a campaign they supported reaches a milestone. */
+export function milestoneSms(campaignTitle: string, pct: number): string {
+  return `"${campaignTitle}" just reached ${pct}% of its goal on Kingdom Sponsor. Thank you for being part of it!`;
+}
+
+/** Sent to a campaign's donors when it ends (final report). */
+export function campaignEndedSms(campaignTitle: string, raisedCents: number, supporters: number): string {
+  return `"${campaignTitle}" has ended. ${kwacha(raisedCents)} was raised from ${supporters} supporters. Thank you for giving — Kingdom Sponsor`;
 }

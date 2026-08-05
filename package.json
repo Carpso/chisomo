@@ -7,9 +7,11 @@
     "dev": "wrangler dev --test-scheduled",
     "db:init": "wrangler d1 execute kingdom-sponsor-db --local --file=./sql/schema.sql",
     "db:remote": "wrangler d1 execute kingdom-sponsor-db --remote --file=./sql/schema.sql",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@sentry/cloudflare": "^10.69.0",
     "firebase-admin": "^14.2.0",
     "hono": "^4.6.0",
     "pdf-lib": "^1.17.1"
@@ -17,6 +19,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260730.1",
     "typescript": "^5.7.0",
+    "vitest": "^4.1.10",
     "wrangler": "^4.118.0"
   }
 }

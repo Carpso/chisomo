@@ -35,7 +35,7 @@ bucket_name = "kingdom-sponsor-media"
 # Vars (plain config, change freely). NOTE: in production, `wrangler secret put`
 # with the same name overrides a var - so these placeholders are dev-only defaults.
 [vars]
-ENV = "sandbox"                 # SMS + OTP debug mode: "sandbox" shows debug code in API, "production" sends real AT SMS
+ENV = "production"              # SMS + OTP mode: "sandbox" shows debug code in API, "production" sends real AT SMS
 AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (not user-facing; used in the AT API call)
 AT_FROM = "KSPONSO"             # registered AT sender ID / shortcode for production SMS (empty = AT default)
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)

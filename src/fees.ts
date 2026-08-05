@@ -81,5 +81,7 @@ export function platformDisbursementFeeCents(availableCents: number, cfg: FeeCon
 }
 
 export function formatKwacha(cents: number): string {
-  return `K${(cents / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const k = cents / 100;
+  const [whole, frac] = k.toFixed(2).split(".");
+  return `K${Number(whole).toLocaleString("en-US")}.${frac}`;
 }
