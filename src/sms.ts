@@ -37,11 +37,12 @@ export async function sendSms(env: SmsEnv, phone: string, message: string): Prom
   }
 
   const send = async (from?: string) => {
+    // AT requires lowercase form field names (username/to/message/from).
     const form = new URLSearchParams({
-      USERNAME: env.AT_USERNAME,
-      TO: safePhone(phone),
-      MESSAGE: message,
-      ...(from ? { FROM: from } : {}),
+      username: env.AT_USERNAME,
+      to: safePhone(phone),
+      message: message,
+      ...(from ? { from } : {}),
     });
     const res = await fetch(AT_MESSAGES_URL, {
       method: "POST",
