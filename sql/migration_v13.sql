@@ -42,6 +42,13 @@ CREATE INDEX IF NOT EXISTS idx_withdraw_status ON withdrawals(status, created_at
 CREATE INDEX IF NOT EXISTS idx_pledges_user    ON recurring_pledges(user_id);
 CREATE INDEX IF NOT EXISTS idx_promos_campaign ON promotions(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_promos_status   ON promotions(status, expires_at);
+CREATE TABLE IF NOT EXISTS announcements (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE INDEX IF NOT EXISTS idx_announce_camp   ON announcements(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_campaigns_host   ON campaigns(host_user_id);
 CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status, promoted, created_at);

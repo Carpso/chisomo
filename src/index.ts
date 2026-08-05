@@ -92,6 +92,24 @@ async function pushToUser(env: Bindings, userId: number | null, title: string, b
     .catch((e) => console.error("push failed:", e));
 }
 
+/** True when the user has at least one registered app device (push-reachable). */
+async function userHasPush(env: Bindings, userId: number | null): Promise<boolean> {
+  if (userId == null) return false;
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM device_tokens WHERE user_id = ?"
+  ).bind(userId).first<{ n: number }>();
+  return (row?.n ?? 0) > 0;
+}
+
+/** Smart channel pick: app users already receive the matching push notification,
+ *  so SMS is only sent as a fallback to users without the app installed
+ *  (keeps SMS volume and cost in check). */
+async function smsIfNoPush(env: Bindings, userId: number | null, phone: string | null, text: string): Promise<void> {
+  if (!phone || !text) return;
+  if (await userHasPush(env, userId)) return;
+  await sendSms(env, phone, text).catch((e) => console.error("sms failed:", e));
+}
+
 /** Push to every user whose phone is on the superadmin list (used for urgent admin alerts). */
 async function pushAndSmsAdmins(env: Bindings, smsText: string, pushTitle: string, pushBody: string): Promise<void> {
   const phones = (env.SUPERADMIN_PHONES ?? "").split(",").map((p) => p.trim()).filter(Boolean);
@@ -126,6 +144,17 @@ async function authUser(c: any): Promise<TokenPayload | null> {
   const token = header.slice(7).trim();
   const payload = await verifyToken(token, c.env.JWT_SECRET as string);
   if (!payload) return null;
+
+  // Sliding session: when the token has less than 60 days left, re-issue a
+  // fresh 90-day token so active users almost never need a new SMS code.
+  const remaining = payload.exp - Math.floor(Date.now() / 1000);
+  if (remaining < 60 * 86400) {
+    const fresh = await signToken(
+      { sub: payload.sub, phone: payload.phone, isHost: payload.isHost },
+      c.env.JWT_SECRET as string
+    );
+    c.header("x-refresh-token", fresh);
+  }
   return payload;
 }
 
@@ -189,16 +218,14 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
   ).bind(row.campaign_id).first<Record<string, any>>();
   const available = await availableBalance(env, row.campaign_id);
   if (campaign?.host_phone) {
-    await sendSms(env, campaign.host_phone, donationReceivedSms(campaign.title, row.amount_cents, available))
-      .catch((e) => console.error("host sms failed:", e));
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, donationReceivedSms(campaign.title, row.amount_cents, available));
     await pushToUser(env, campaign.host_user_id, "New gift received",
       `Someone gave ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign.title}".`,
       { type: "donation_received", campaignId: String(campaign.id) })
       .catch((e) => console.error("host push failed:", e));
   }
   if (row.phone) {
-    await sendSms(env, row.phone, donationConfirmedSms(campaign?.title ?? "campaign", row.amount_cents, referenceId))
-      .catch((e) => console.error("donor sms failed:", e));
+    await smsIfNoPush(env, row.donor_user_id, row.phone, donationConfirmedSms(campaign?.title ?? "campaign", row.amount_cents, referenceId));
     await pushToUser(env, row.donor_user_id, "Gift confirmed",
       `Thank you! Your gift of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign?.title ?? "campaign"}" is confirmed.`,
       { type: "donation_confirmed", campaignId: String(campaign?.id ?? ""), contributionId: String(row.id) })
@@ -246,8 +273,7 @@ async function maybeNotifyMilestones(env: Bindings, campaign: Record<string, any
   await pushToUser(env, campaign.host_user_id, title, body, { type: "milestone", campaignId: String(campaign.id) })
     .catch(() => {});
   if (pct === 100 && campaign.host_phone) {
-    await sendSms(env, campaign.host_phone, `🎉 ${campaign.title} has reached its goal of ${(campaign.goal_cents / 100).toLocaleString()} ZMW!`)
-      .catch((e) => console.error("milestone host sms failed:", e));
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, `🎉 ${campaign.title} has reached its goal of ${(campaign.goal_cents / 100).toLocaleString()} ZMW!`);
   }
 }
 
@@ -272,7 +298,8 @@ async function availableBalance(env: Bindings, campaignId: number): Promise<numb
     env.DB.prepare("SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')").bind(campaignId),
   ]);
   const g = (r: any) => (r?.results?.[0]?.s ?? r?.[0]?.s ?? 0);
-  return g(raised) - g(platformFees) - g(lipilaFees) - g(withdrawn) - g(disbursementFees) - g(payoutPlatformFees);
+  const balance = g(raised) - g(platformFees) - g(lipilaFees) - g(withdrawn) - g(disbursementFees) - g(payoutPlatformFees);
+  return Math.max(0, balance); // never show a negative withdrawable balance
 }
 
 /** Create a payout of the campaign's available balance, deducting Lipila's disbursement fee and Kingdom Sponsor's payout cut. Returns the host payout cents sent (0 if none). */
@@ -315,8 +342,7 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
     ).bind(referenceId).run();
     console.error("disbursement failed:", e);
     if (campaign.host_phone) {
-      await sendSms(env, campaign.host_phone, payoutFailedSms(campaign.title, payoutCents))
-        .catch((err) => console.error("payout-failed sms failed:", err));
+      await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, payoutFailedSms(campaign.title, payoutCents));
       await pushToUser(env, campaign.host_user_id, "Payout delayed",
         `We'll retry your payout of ${(payoutCents / 100).toLocaleString()} ZMW for "${campaign.title}" automatically.`,
         { type: "payout_failed", campaignId: String(campaign.id) })
@@ -481,8 +507,7 @@ async function approvePromotion(env: Bindings, promoId: number): Promise<void> {
     "SELECT c.title, c.id, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(promo.campaign_id).first<Record<string, any>>();
   if (campaign?.host_phone) {
-    await sendSms(env, campaign.host_phone, promotionActiveSms(campaign.title, days, until.slice(0, 10)))
-      .catch((e) => console.error("promo sms failed:", e));
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, promotionActiveSms(campaign.title, days, until.slice(0, 10)));
     await pushToUser(env, campaign.host_user_id, "Your campaign is promoted",
       `"${campaign.title}" is now at the top of Kingdom Sponsor for ${days} days.`,
       { type: "promotion_active", campaignId: String(campaign.id) })
@@ -505,8 +530,7 @@ async function rejectPromotion(env: Bindings, promoId: number): Promise<void> {
     "SELECT c.title, c.id, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(promo.campaign_id).first<Record<string, any>>();
   if (campaign?.host_phone) {
-    await sendSms(env, campaign.host_phone, promotionRejectedSms(campaign.title))
-      .catch((e) => console.error("promo reject sms failed:", e));
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, promotionRejectedSms(campaign.title));
     await pushToUser(env, campaign.host_user_id, "Promotion not approved",
       `Your promotion for "${campaign.title}" was declined. Contact support about a refund.`,
       { type: "promotion_rejected", campaignId: String(campaign.id) })
@@ -565,8 +589,7 @@ async function confirmRefund(env: Bindings, referenceId: string): Promise<void> 
     "SELECT c.title, c.id, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(promo.campaign_id).first<Record<string, any>>();
   if (!campaign?.host_phone) return;
-  await sendSms(env, campaign.host_phone, promotionRefundedSms(campaign.title, refund.amount_cents))
-    .catch((e) => console.error("refund sms failed:", e));
+  await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, promotionRefundedSms(campaign.title, refund.amount_cents));
   await pushToUser(env, campaign.host_user_id, "Promotion refunded",
     `Your promotion payment of ${formatKwacha(refund.amount_cents)} for "${campaign.title}" has been refunded to your mobile money.`,
     { type: "promotion_refunded", campaignId: String(campaign.id) })
@@ -590,8 +613,7 @@ async function runPromotionExpiry(env: Bindings): Promise<void> {
   // Tell hosts their promotion window ended (and that they can renew).
   for (const row of expired.results) {
     if (row.host_phone) {
-      await sendSms(env, row.host_phone, promotionExpiredSms(row.title))
-        .catch((e) => console.error("promo expiry sms failed:", e));
+      await smsIfNoPush(env, row.host_user_id, row.host_phone, promotionExpiredSms(row.title));
     }
     await pushToUser(env, row.host_user_id, "Your promotion has ended",
       `"${row.title}" is no longer promoted. You can promote it again anytime in the app.`,
@@ -614,8 +636,11 @@ async function runTicketAutoClose(env: Bindings): Promise<void> {
       "UPDATE support_tickets SET status = 'closed', closed_at = datetime('now', '+2 hours'), admin_reply = CASE WHEN admin_reply IS NULL THEN ? ELSE admin_reply || char(10) || ? END WHERE id = ? AND status = 'open'"
     ).bind(note, note, row.id).run();
     if (row.phone) {
-      await sendSms(env, row.phone, `Your support request #${row.id} ("${row.subject}") was closed after 7 days without a reply. Open it again in the app if you still need help. Kingdom Sponsor`)
-        .catch((e) => console.error("ticket close sms failed:", e));
+      await smsIfNoPush(env, row.user_id, row.phone, `Your support request #${row.id} ("${row.subject}") was closed after 7 days without a reply. Open it again in the app if you still need help. Kingdom Sponsor`);
+      await pushToUser(env, row.user_id, "Support request closed",
+        `Your request "${row.subject}" was closed after 7 days without a reply. Open it again if you still need help.`,
+        { type: "ticket_closed", ticketId: String(row.id) })
+        .catch((e) => console.error("ticket close push failed:", e));
     }
   }
 }
@@ -641,7 +666,7 @@ async function runPledgeReminders(env: Bindings): Promise<void> {
 
   for (const row of rows.results) {
     const message = pledgeReminderSms(row.campaign_title, row.amount_cents, row.campaign_id);
-    await sendSms(env, row.phone, message).catch((e) => console.error("pledge sms failed:", e));
+    await smsIfNoPush(env, row.user_id, row.phone, message);
 
     // Push notification
     await pushToUser(env, row.user_id, "Monthly pledge due",
@@ -669,8 +694,7 @@ async function confirmWithdrawal(env: Bindings, referenceId: string): Promise<vo
     "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(row.campaign_id).first<Record<string, any>>();
   if (campaign?.host_phone) {
-    await sendSms(env, campaign.host_phone, payoutSentSms(campaign.title, row.amount_cents))
-      .catch((e) => console.error("payout sms failed:", e));
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, payoutSentSms(campaign.title, row.amount_cents));
     await pushToUser(env, campaign.host_user_id, "Payout sent",
       `Your payout of ${(row.amount_cents / 100).toLocaleString()} ZMW for "${campaign.title}" is on its way to your mobile money.`,
       { type: "payout_sent", campaignId: String(campaign.id) })
@@ -1468,9 +1492,16 @@ app.post("/api/campaigns/:id/announcements", async (c) => {
     return c.json({ error: "Announcement must be 1-500 characters" }, 400);
   }
 
-  const r = await c.env.DB.prepare(
-    "INSERT INTO announcements (campaign_id, user_id, body) VALUES (?, ?, ?)"
-  ).bind(campaign.id, user.sub, text).run();
+  let lastId = 0;
+  try {
+    const r = await c.env.DB.prepare(
+      "INSERT INTO announcements (campaign_id, user_id, body) VALUES (?, ?, ?)"
+    ).bind(campaign.id, user.sub, text).run();
+    lastId = r.meta.last_row_id ?? 0;
+  } catch (e) {
+    console.error("announcement insert failed:", e);
+    return c.json({ error: `Could not save announcement: ${(e as Error).message}` }, 500);
+  }
 
   // Push to every confirmed donor of this campaign with an FCM token.
   if (envPushConfigured(c.env)) {
@@ -1491,7 +1522,7 @@ app.post("/api/campaigns/:id/announcements", async (c) => {
     }
   }
 
-  return c.json({ ok: true, id: r.meta.last_row_id, createdAt: new Date().toISOString() });
+  return c.json({ ok: true, id: lastId, createdAt: new Date().toISOString() });
 });
 
 // ---------- Couple/Family Account Linking ----------
@@ -1995,8 +2026,7 @@ app.post("/api/support/tickets/:id/reply", async (c) => {
     await c.env.DB.prepare(
       "UPDATE support_tickets SET admin_reply = ?, status = 'answered', updated_at = datetime('now', '+2 hours') WHERE id = ?"
     ).bind(text, ticket.id).run();
-    await sendSms(c.env, ticket.phone, supportReplySms(ticket.subject))
-      .catch((e) => console.error("ticket reply sms failed:", e));
+    await smsIfNoPush(c.env, ticket.user_id, ticket.phone, supportReplySms(ticket.subject));
     await pushToUser(c.env, ticket.user_id, "Support replied",
       `Your request "${ticket.subject}" has a new reply.`, { type: "ticket_reply", ticketId: String(ticket.id) })
       .catch((e) => console.error("ticket reply push failed:", e));
@@ -2501,10 +2531,12 @@ app.post("/api/campaigns/:id/end", async (c) => {
     }
   }
 
-  // SMS to donors who gave by phone (deduped).
+  // SMS to donors without the app (app users already got the push above).
   const smsPhones = await c.env.DB.prepare(
-    `SELECT DISTINCT phone FROM contributions
-     WHERE campaign_id = ? AND status = 'confirmed' AND phone IS NOT NULL`
+    `SELECT DISTINCT co.phone FROM contributions co
+     WHERE co.campaign_id = ? AND co.status = 'confirmed' AND co.phone IS NOT NULL
+       AND (co.donor_user_id IS NULL OR NOT EXISTS (
+         SELECT 1 FROM device_tokens dt WHERE dt.user_id = co.donor_user_id))`
   ).bind(campaign.id).all<{ phone: string }>();
   for (const row of smsPhones.results) {
     await sendSms(c.env, row.phone, campaignEndedSms(campaign.title, raised, supporters))
