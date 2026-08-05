@@ -36,25 +36,39 @@ export async function sendSms(env: SmsEnv, phone: string, message: string): Prom
     return;
   }
 
-  const form = new URLSearchParams({
-    USERNAME: env.AT_USERNAME,
-    TO: safePhone(phone),
-    MESSAGE: message,
-    ...(env.AT_FROM ? { FROM: env.AT_FROM } : {}),
-  });
+  const send = async (from?: string) => {
+    const form = new URLSearchParams({
+      USERNAME: env.AT_USERNAME,
+      TO: safePhone(phone),
+      MESSAGE: message,
+      ...(from ? { FROM: from } : {}),
+    });
+    const res = await fetch(AT_MESSAGES_URL, {
+      method: "POST",
+      headers: {
+        Apikey: env.AT_API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body: form.toString(),
+    });
+    const body = await res.text().catch(() => "");
+    if (res.ok) return;
+    throw new Error(`Africa's Talking SMS failed (${res.status}): ${body || "empty body"}`);
+  };
 
-  const res = await fetch(AT_MESSAGES_URL, {
-    method: "POST",
-    headers: {
-      Apikey: env.AT_API_KEY,
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
-    body: form.toString(),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(`Africa's Talking SMS failed (${res.status}): ${JSON.stringify(data)}`);
+  try {
+    await send(env.AT_FROM);
+  } catch (e) {
+    // AT returns 400 with "Invalid senderId" until a sender ID is approved.
+    // Fall back to the account's default sender so OTPs keep flowing; when
+    // KSPONSOR gets approved, this fallback stops being used automatically.
+    if (env.AT_FROM && String(e).includes("(400)")) {
+      console.error("[SMS] sender ID rejected, retrying without FROM:", String(e).slice(0, 200));
+      await send(undefined);
+      console.warn("[SMS] delivered with default sender (KSPONSOR not approved yet)");
+      return;
+    }
+    throw e;
   }
 }
