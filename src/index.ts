@@ -2759,7 +2759,7 @@ app.get("/api/admin/stats", async (c) => {
   // Growth + activity counters (7d/30d windows). Indexed via created_at columns.
   const [users, campaigns, donations, receipts, pledges, tickets, deleteReqs] = await c.env.DB.batch([
     c.env.DB.prepare(
-      "SELECT (SELECT COUNT(*) FROM users) AS total, (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-30 days')) AS d30"
+      "SELECT (SELECT COUNT(*) FROM users) AS total, (SELECT COUNT(*) FROM users WHERE is_host = 1) AS hosts, (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-30 days')) AS d30"
     ),
     c.env.DB.prepare(
       "SELECT (SELECT COUNT(*) FROM campaigns WHERE status != 'deleted') AS total, (SELECT COUNT(*) FROM campaigns WHERE created_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM campaigns WHERE created_at >= datetime('now', '-30 days')) AS d30"
@@ -2830,6 +2830,7 @@ app.get("/api/admin/stats", async (c) => {
       pendingApplications: pending.n,
       dailyRateCents: Math.round(total.s / days),
       usersTotal: usersRow.total ?? 0,
+      hostsTotal: usersRow.hosts ?? 0,
       newUsers7d: usersRow.d7 ?? 0,
       newUsers30d: usersRow.d30 ?? 0,
       campaignsTotal: campaignsRow.total ?? 0,
