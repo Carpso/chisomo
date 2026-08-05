@@ -2141,8 +2141,8 @@ async function buildReceiptPdf(i: ReceiptInput): Promise<Uint8Array> {
   const { width } = page.getSize();
 
   // App colors: primary = #E65100 (deep orange), gold = #D4A017
-  const primaryColor = rgb(0.12, 0.38, 0.72);   // approx deep orange
-  const goldColor = rgb(0.83, 0.83, 0.09);      // gold accent
+  const primaryColor = rgb(0.902, 0.318, 0.0);   // #E65100 deep orange
+  const goldColor = rgb(0.827, 0.627, 0.090);    // #D4A017 gold
   const textMuted = rgb(0.47, 0.41, 0.36);
   const textDark = rgb(0.17, 0.125, 0.07);
 
