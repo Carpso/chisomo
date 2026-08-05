@@ -103,6 +103,17 @@ export async function checkCollectionStatus(env: LipilaEnv, referenceId: string)
   return { status: data.status, message: data.message, amount: data.amount };
 }
 
+/** Check status of a disbursement by referenceId. */
+export async function checkDisbursementStatus(env: LipilaEnv, referenceId: string): Promise<LipilaStatus> {
+  const res = await fetch(
+    `${lipilaBase(env)}/disbursements/status/${encodeURIComponent(referenceId)}`,
+    { headers: { accept: "application/json", "x-api-key": env.LIPILA_API_KEY } }
+  );
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Lipila disbursement status check failed (${res.status}): ${JSON.stringify(data)}`);
+  return { status: data.status, message: data.message, amount: data.amount };
+}
+
 /** Current available wallet balance in kwacha. */
 export async function getWalletBalance(env: LipilaEnv): Promise<number> {
   const res = await fetch(

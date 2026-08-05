@@ -5,11 +5,16 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { signToken, verifyToken, sha256Hex, type TokenPayload } from "./jwt";
-import { createCollection, checkCollectionStatus, createDisbursement, getWalletBalance, type LipilaEnv } from "./lipila";
+import { createCollection, checkCollectionStatus, checkDisbursementStatus, createDisbursement, getWalletBalance, type LipilaEnv } from "./lipila";
 import { sendOtpSms, sendSms } from "./sms";
 import { loadFeeConfig, donationFees, payoutAmountCents, disbursementFeeCents, platformDisbursementFeeCents, feeConfigPublic, formatKwacha } from "./fees";
-import { generateUsername, ensureUser, donorTotalCents, tierFor } from "./donors";
-import { donationConfirmedSms, donationReceivedSms, payoutSentSms, pledgeReminderSms, promotionActiveSms } from "./messages";
+import { generateUsername, ensureUser, donorTotalCents, donorVisibleCents, tierFor } from "./donors";
+import { sendPushNotification, sendMulticastPush } from "./firebase";
+import {
+  donationConfirmedSms, donationReceivedSms, payoutSentSms, payoutFailedSms, pledgeReminderSms,
+  promotionActiveSms, promotionRejectedSms, campaignDeletedSms, deleteRequestReceivedSms,
+  deleteRequestRejectedSms, supportReplySms, supportReceivedSms,
+} from "./messages";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
 type Bindings = LipilaEnv & SmsEnv2 & {
@@ -27,6 +32,9 @@ type Bindings = LipilaEnv & SmsEnv2 & {
   SUPERADMIN_PHONES?: string;
   PROMO_PRICE_CENTS?: string;
   PROMO_DAYS?: string;
+  FIREBASE_CLIENT_EMAIL?: string;
+  FIREBASE_PRIVATE_KEY?: string;
+  SENTRY_DSN?: string;
 };
 
 interface SmsEnv2 {
@@ -62,6 +70,43 @@ function isAdminPhone(env: Bindings, phone: string | undefined): boolean {
   return admins.includes(normalizePhone(phone));
 }
 
+function envPushConfigured(env: Bindings): boolean {
+  return !!env.FIREBASE_CLIENT_EMAIL && !!env.FIREBASE_PRIVATE_KEY;
+}
+
+function fbEnv(env: Bindings) {
+  return { FIREBASE_CLIENT_EMAIL: env.FIREBASE_CLIENT_EMAIL!, FIREBASE_PRIVATE_KEY: env.FIREBASE_PRIVATE_KEY! };
+}
+
+/** Best-effort push to a user's registered device (no-op when FCM isn't configured). */
+async function pushToUser(env: Bindings, userId: number | null, title: string, body: string, data?: Record<string, string>): Promise<void> {
+  if (!envPushConfigured(env) || !userId) return;
+  const u = await env.DB.prepare("SELECT fcm_token FROM users WHERE id = ?")
+    .bind(userId).first<{ fcm_token: string | null }>();
+  if (!u?.fcm_token) return;
+  await sendPushNotification(fbEnv(env), u.fcm_token, title, body, data)
+    .catch((e) => console.error("push failed:", e));
+}
+
+/** Push to every user whose phone is on the superadmin list (used for urgent admin alerts). */
+async function pushAndSmsAdmins(env: Bindings, smsText: string, pushTitle: string, pushBody: string): Promise<void> {
+  const phones = (env.SUPERADMIN_PHONES ?? "").split(",").map((p) => p.trim()).filter(Boolean);
+  for (const p of phones) {
+    await sendSms(env, normalizePhone(p), smsText).catch((e) => console.error("admin sms failed:", e));
+  }
+  if (envPushConfigured(env) && phones.length) {
+    const placeholders = phones.map(() => "?").join(",");
+    const admins = await env.DB.prepare(
+      `SELECT fcm_token FROM users WHERE fcm_token IS NOT NULL AND phone IN (${placeholders})`
+    ).bind(...phones).all<{ fcm_token: string }>();
+    const tokens = admins.results.map((a) => a.fcm_token);
+    if (tokens.length) {
+      await sendMulticastPush(fbEnv(env), tokens, pushTitle, pushBody, { type: "admin_alert" })
+        .catch((e) => console.error("admin push failed:", e));
+    }
+  }
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()
@@ -88,20 +133,28 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
   if (!row || row.status === "confirmed") return;
 
   await env.DB.prepare(
-    "UPDATE contributions SET status = 'confirmed', confirmed_at = datetime('now') WHERE id = ?"
+    "UPDATE contributions SET status = 'confirmed', confirmed_at = datetime('now', '+2 hours') WHERE id = ?"
   ).bind(row.id).run();
 
   const campaign = await env.DB.prepare(
-    "SELECT c.*, u.phone AS host_phone FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+    "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(row.campaign_id).first<Record<string, any>>();
   const available = await availableBalance(env, row.campaign_id);
   if (campaign?.host_phone) {
     await sendSms(env, campaign.host_phone, donationReceivedSms(campaign.title, row.amount_cents, available))
       .catch((e) => console.error("host sms failed:", e));
+    await pushToUser(env, campaign.host_user_id, "New gift received",
+      `Someone gave ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign.title}".`,
+      { type: "donation_received", campaignId: String(campaign.id) })
+      .catch((e) => console.error("host push failed:", e));
   }
   if (row.phone) {
     await sendSms(env, row.phone, donationConfirmedSms(campaign?.title ?? "campaign", row.amount_cents, referenceId))
       .catch((e) => console.error("donor sms failed:", e));
+    await pushToUser(env, row.donor_user_id, "Gift confirmed",
+      `Thank you! Your gift of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign?.title ?? "campaign"}" is confirmed.`,
+      { type: "donation_confirmed", campaignId: String(campaign?.id ?? ""), contributionId: String(row.id) })
+      .catch((e) => console.error("donor push failed:", e));
   }
 
   await maybeAutoDisburse(env, row.campaign_id);
@@ -114,45 +167,33 @@ async function maybeAutoDisburse(env: Bindings, campaignId: number): Promise<voi
   ).bind(campaignId).first<Record<string, any>>();
   if (!campaign) return;
 
-  const available = await availableBalance(env, campaignId);
-  if (available < campaign.min_withdraw_cents) return; // hold below threshold; sweep later
-
   await createWithdrawal(env, campaignId);
 }
 
-/** raised - platform fees - collection fees - already withdrawn - payout fees */
+/** raised - platform fees (collection) - Lipila collection fees - already withdrawn - payout fees (Lipila + platform) */
 async function availableBalance(env: Bindings, campaignId: number): Promise<number> {
-  const raised = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(amount_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'"
-  ).bind(campaignId).first<{ s: number }>()) ?? { s: 0 };
-  const platformFees = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'"
-  ).bind(campaignId).first<{ s: number }>()) ?? { s: 0 };
-  const lipilaFees = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(lipila_fee_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'"
-  ).bind(campaignId).first<{ s: number }>()) ?? { s: 0 };
-  const withdrawn = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(amount_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')"
-  ).bind(campaignId).first<{ s: number }>()) ?? { s: 0 };
-  const disbursementFees = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(disbursement_fee_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')"
-  ).bind(campaignId).first<{ s: number }>()) ?? { s: 0 };
-  const payoutPlatformFees = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')"
-  ).bind(campaignId).first<{ s: number }>()) ?? { s: 0 };
-  return raised.s - platformFees.s - lipilaFees.s - withdrawn.s - disbursementFees.s - payoutPlatformFees.s;
+  const [raised, platformFees, lipilaFees, withdrawn, disbursementFees, payoutPlatformFees] = await env.DB.batch([
+    env.DB.prepare("SELECT COALESCE(SUM(amount_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'").bind(campaignId),
+    env.DB.prepare("SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'").bind(campaignId),
+    env.DB.prepare("SELECT COALESCE(SUM(lipila_fee_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'").bind(campaignId),
+    env.DB.prepare("SELECT COALESCE(SUM(amount_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')").bind(campaignId),
+    env.DB.prepare("SELECT COALESCE(SUM(disbursement_fee_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')").bind(campaignId),
+    env.DB.prepare("SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')").bind(campaignId),
+  ]);
+  const g = (r: any) => (r?.results?.[0]?.s ?? r?.[0]?.s ?? 0);
+  return g(raised) - g(platformFees) - g(lipilaFees) - g(withdrawn) - g(disbursementFees) - g(payoutPlatformFees);
 }
 
 /** Create a payout of the campaign's available balance, deducting Lipila's disbursement fee and Kingdom Sponsor's payout cut. Returns the host payout cents sent (0 if none). */
 async function createWithdrawal(env: Bindings, campaignId: number): Promise<number> {
   const cfg = loadFeeConfig(env);
   const campaign = await env.DB.prepare(
-    "SELECT c.*, u.phone AS host_phone FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+    "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(campaignId).first<Record<string, any>>();
   if (!campaign) return 0;
 
   const available = await availableBalance(env, campaignId);
-  if (available < campaign.min_withdraw_cents) return 0;
+  if (available < campaign.min_withdraw_cents) return 0; // honour the host's set payout minimum
 
   const payoutCents = payoutAmountCents(available, cfg);
   const lipilaFee = disbursementFeeCents(available, cfg);
@@ -182,6 +223,14 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
       "UPDATE withdrawals SET status = 'failed' WHERE lipila_reference = ?"
     ).bind(referenceId).run();
     console.error("disbursement failed:", e);
+    if (campaign.host_phone) {
+      await sendSms(env, campaign.host_phone, payoutFailedSms(campaign.title, payoutCents))
+        .catch((err) => console.error("payout-failed sms failed:", err));
+      await pushToUser(env, campaign.host_user_id, "Payout delayed",
+        `We'll retry your payout of ${(payoutCents / 100).toLocaleString()} ZMW for "${campaign.title}" automatically.`,
+        { type: "payout_failed", campaignId: String(campaign.id) })
+        .catch((err) => console.error("payout-failed push failed:", err));
+    }
     return 0;
   }
 }
@@ -222,15 +271,18 @@ async function confirmFeeSweep(env: Bindings, referenceId: string): Promise<void
   ).bind(referenceId).run();
 }
 
-/** Accumulated donation platform fees that have been earned but not yet settled to Kingdom Sponsor. */
+/** Accumulated platform fees (collection + payout cuts) earned but not yet settled to Kingdom Sponsor. */
 async function pendingDonationFees(env: Bindings): Promise<number> {
-  const earned = (await env.DB.prepare(
+  const earnedDonations = (await env.DB.prepare(
     "SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM contributions WHERE status = 'confirmed'"
+  ).first<{ s: number }>())?.s ?? 0;
+  const earnedPayouts = (await env.DB.prepare(
+    "SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM withdrawals WHERE status = 'success'"
   ).first<{ s: number }>())?.s ?? 0;
   const settled = (await env.DB.prepare(
     "SELECT COALESCE(SUM(amount_cents),0) AS s FROM fee_sweeps WHERE status = 'success'"
   ).first<{ s: number }>())?.s ?? 0;
-  return earned - settled;
+  return earnedDonations + earnedPayouts - settled;
 }
 
 /** Scheduled: sweep accumulated donation platform fees to SETTLEMENT_PHONE (only when worthwhile). */
@@ -253,11 +305,27 @@ async function runFeeSweep(env: Bindings): Promise<void> {
 
 // ---------- promoted campaigns (top-5 paid slots) ----------
 
-function promoPrice(env: Bindings): number {
+async function getSetting(env: Bindings, key: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+async function setSetting(env: Bindings, key: string, value: string): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).bind(key, value).run();
+}
+
+/** Promotion price/days are set by the superadmin in the app (stored in app_settings, env as fallback). */
+async function promoPrice(env: Bindings): Promise<number> {
+  const v = await getSetting(env, "promo_price_cents");
+  if (v) { const n = parseInt(v, 10); if (n > 0) return n; }
   return parseInt(env.PROMO_PRICE_CENTS ?? "", 10) > 0 ? parseInt(env.PROMO_PRICE_CENTS!, 10) : 15000;
 }
 
-function promoDays(env: Bindings): number {
+async function promoDays(env: Bindings): Promise<number> {
+  const v = await getSetting(env, "promo_days");
+  if (v) { const n = parseInt(v, 10); if (n > 0) return n; }
   return parseInt(env.PROMO_DAYS ?? "", 10) > 0 ? parseInt(env.PROMO_DAYS!, 10) : 7;
 }
 
@@ -282,7 +350,32 @@ async function confirmPromotion(env: Bindings, referenceId: string): Promise<voi
   ).bind(referenceId).first<Record<string, any>>();
   if (!promo) return;
 
-  const days = promo.days || promoDays(env);
+  // Payment received: the promotion goes to the superadmin for approval
+  // before it appears in the promoted top-5 list.
+  await env.DB.prepare(
+    "UPDATE promotions SET status = 'pending_approval' WHERE id = ?"
+  ).bind(promo.id).run();
+
+  const campaign = await env.DB.prepare(
+    "SELECT c.title, u.phone AS host_phone FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(promo.campaign_id).first<Record<string, any>>();
+  if (campaign?.host_phone) {
+    await sendSms(
+      env,
+      campaign.host_phone,
+      `Kingdom Sponsor: your K${(promo.amount_cents / 100).toLocaleString()} promotion payment for "${campaign.title}" was received and is pending approval. You'll be notified once it goes live.`
+    ).catch((e) => console.error("promo pending sms failed:", e));
+  }
+}
+
+/** Approve a paid promotion (superadmin). Makes it live in the top-5 list. */
+async function approvePromotion(env: Bindings, promoId: number): Promise<void> {
+  const promo = await env.DB.prepare(
+    "SELECT * FROM promotions WHERE id = ? AND status = 'pending_approval'"
+  ).bind(promoId).first<Record<string, any>>();
+  if (!promo) return;
+
+  const days = promo.days || (await promoDays(env));
   const until = new Date(Date.now() + days * 86400000).toISOString();
   await env.DB.batch([
     env.DB.prepare(
@@ -294,11 +387,39 @@ async function confirmPromotion(env: Bindings, referenceId: string): Promise<voi
   ]);
 
   const campaign = await env.DB.prepare(
-    "SELECT c.*, u.phone AS host_phone FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+    "SELECT c.title, c.id, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(promo.campaign_id).first<Record<string, any>>();
   if (campaign?.host_phone) {
     await sendSms(env, campaign.host_phone, promotionActiveSms(campaign.title, days, until.slice(0, 10)))
       .catch((e) => console.error("promo sms failed:", e));
+    await pushToUser(env, campaign.host_user_id, "Your campaign is promoted",
+      `"${campaign.title}" is now at the top of Kingdom Sponsor for ${days} days.`,
+      { type: "promotion_active", campaignId: String(campaign.id) })
+      .catch((e) => console.error("promo push failed:", e));
+  }
+}
+
+/** Reject a paid promotion (superadmin). */
+async function rejectPromotion(env: Bindings, promoId: number): Promise<void> {
+  const promo = await env.DB.prepare(
+    "SELECT * FROM promotions WHERE id = ? AND status = 'pending_approval'"
+  ).bind(promoId).first<Record<string, any>>();
+  if (!promo) return;
+
+  await env.DB.prepare(
+    "UPDATE promotions SET status = 'rejected' WHERE id = ?"
+  ).bind(promoId).run();
+
+  const campaign = await env.DB.prepare(
+    "SELECT c.title, c.id, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(promo.campaign_id).first<Record<string, any>>();
+  if (campaign?.host_phone) {
+    await sendSms(env, campaign.host_phone, promotionRejectedSms(campaign.title))
+      .catch((e) => console.error("promo reject sms failed:", e));
+    await pushToUser(env, campaign.host_user_id, "Promotion not approved",
+      `Your promotion for "${campaign.title}" was declined. Contact support about a refund.`,
+      { type: "promotion_rejected", campaignId: String(campaign.id) })
+      .catch((e) => console.error("promo reject push failed:", e));
   }
 }
 
@@ -318,34 +439,30 @@ async function runPromotionExpiry(env: Bindings): Promise<void> {
 async function runPledgeReminders(env: Bindings): Promise<void> {
   const zambia = new Date(Date.now() + 2 * 3600000); // UTC+2
   const today = zambia.getUTCDate();
+  const daysInMonth = new Date(Date.UTC(zambia.getUTCFullYear(), zambia.getUTCMonth() + 1, 0)).getUTCDate();
 
+  // Due if: pledge day <= today (due today or late) OR pledge day > days in month (e.g. 31st in a 30-day month).
+  // Remind at most once per month: only rows not yet reminded this month.
   const rows = await env.DB.prepare(
     `SELECT p.id, p.phone, p.amount_cents, p.day_of_month, p.user_id,
             c.title AS campaign_title, c.id AS campaign_id
      FROM recurring_pledges p JOIN campaigns c ON c.id = p.campaign_id
-     WHERE p.active = 1 AND p.day_of_month = ?`
-  ).bind(today).all<Record<string, any>>();
+     WHERE p.active = 1
+       AND (p.last_reminded_at IS NULL OR date(p.last_reminded_at) < date('now', '+2 hours'))
+       AND (p.day_of_month <= ? OR p.day_of_month > ?)`
+  ).bind(today, daysInMonth).all<Record<string, any>>();
 
   for (const row of rows.results) {
     const message = pledgeReminderSms(row.campaign_title, row.amount_cents, row.campaign_id);
     await sendSms(env, row.phone, message).catch((e) => console.error("pledge sms failed:", e));
 
     // Push notification
-    const user = await env.DB.prepare("SELECT fcm_token FROM users WHERE id = ?")
-      .bind(row.user_id).first<{ fcm_token: string | null }>();
-    if (user?.fcm_token && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY) {
-      const fbEnv = {
-        FIREBASE_CLIENT_EMAIL: env.FIREBASE_CLIENT_EMAIL,
-        FIREBASE_PRIVATE_KEY: env.FIREBASE_PRIVATE_KEY,
-      };
-      await sendPushNotification(fbEnv, user.fcm_token,
-        "Monthly giving reminder",
-        `Your pledge of K${(row.amount_cents / 100).toLocaleString()} to "${row.campaign_title}" is due today.`,
-        { type: "pledge_reminder", campaignId: String(row.campaign_id) }
-      ).catch((e) => console.error("push failed:", e));
-    }
+    await pushToUser(env, row.user_id, "Monthly pledge due",
+      `Your pledge of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${row.campaign_title}" is due.`,
+      { type: "pledge_reminder", campaignId: String(row.campaign_id) })
+      .catch((e) => console.error("push failed:", e));
 
-    await env.DB.prepare("UPDATE recurring_pledges SET last_reminded_at = datetime('now') WHERE id = ?")
+    await env.DB.prepare("UPDATE recurring_pledges SET last_reminded_at = datetime('now', '+2 hours') WHERE id = ?")
       .bind(row.id).run();
   }
 }
@@ -362,11 +479,36 @@ async function confirmWithdrawal(env: Bindings, referenceId: string): Promise<vo
     await settlePlatformFees(env, referenceId, row.platform_fee_cents);
   }
   const campaign = await env.DB.prepare(
-    "SELECT c.*, u.phone AS host_phone FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+    "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(row.campaign_id).first<Record<string, any>>();
   if (campaign?.host_phone) {
     await sendSms(env, campaign.host_phone, payoutSentSms(campaign.title, row.amount_cents))
       .catch((e) => console.error("payout sms failed:", e));
+    await pushToUser(env, campaign.host_user_id, "Payout sent",
+      `Your payout of ${(row.amount_cents / 100).toLocaleString()} ZMW for "${campaign.title}" is on its way to your mobile money.`,
+      { type: "payout_sent", campaignId: String(campaign.id) })
+      .catch((e) => console.error("payout push failed:", e));
+  }
+}
+
+/** Scheduled: re-check pending payouts with Lipila in case a webhook was missed. */
+async function runWithdrawalStatusChecks(env: Bindings): Promise<void> {
+  const rows = await env.DB.prepare(
+    "SELECT id, lipila_reference FROM withdrawals WHERE status = 'pending' AND lipila_reference IS NOT NULL ORDER BY created_at ASC LIMIT 50"
+  ).all<{ id: number; lipila_reference: string }>();
+  for (const row of rows.results) {
+    try {
+      const status = await checkDisbursementStatus(env, row.lipila_reference);
+      const s = String(status.status ?? "").toLowerCase();
+      if (s.includes("success") || s.includes("complete")) {
+        await confirmWithdrawal(env, row.lipila_reference);
+      } else if (s.includes("fail") || s.includes("cancel") || s.includes("reject")) {
+        await env.DB.prepare("UPDATE withdrawals SET status = 'failed' WHERE id = ? AND status = 'pending'")
+          .bind(row.id).run();
+      }
+    } catch (e) {
+      console.error("withdrawal status check failed:", row.lipila_reference, e);
+    }
   }
 }
 
@@ -401,17 +543,25 @@ app.post("/api/auth/request-otp", async (c) => {
     "INSERT INTO otps (phone, code_hash, expires_at, sent_at) VALUES (?, ?, ?, ?)"
   ).bind(phone, codeHash, nowSec + ttlMin * 60, nowSec).run();
 
-  let debugCode: string | undefined;
-  try {
-    await sendOtpSms(c.env, phone, code);
-  } catch (e) {
-    if (c.env.ENV === "production") {
+  // Send the real SMS via Twilio when live (ENV=production). In sandbox the
+  // code is logged server-side and surfaced to the app as `debugCode`, so any
+  // number can still complete login without AT/Twilio sandbox restrictions.
+  if (c.env.ENV === "production") {
+    try {
+      await sendOtpSms(c.env, phone, code);
+    } catch (e) {
       console.error("SMS failed:", e);
       return c.json({ error: "Could not send SMS. Try again." }, 502);
     }
-    debugCode = code; // sandbox / no AT creds: return the code for testing
+  } else {
+    try {
+      await sendOtpSms(c.env, phone, code);
+    } catch (e) {
+      console.error(`SMS to ${phone} skipped (sandbox):`, e);
+    }
   }
 
+  const debugCode = c.env.ENV === "production" ? undefined : code;
   return c.json({ message: "Code sent", expiresInSeconds: ttlMin * 60, ...(debugCode ? { debugCode } : {}) });
 });
 
@@ -458,6 +608,7 @@ app.post("/api/auth/verify-otp", async (c) => {
       phone: user.phone,
       username: user.username,
       name: user.name,
+      avatarUrl: user.avatar_url ?? null,
       isHost: !!user.is_host,
       isAdmin: isAdminPhone(c.env, user.phone),
       hostStatus: user.host_status ?? "none",
@@ -468,21 +619,22 @@ app.post("/api/auth/verify-otp", async (c) => {
 // ---------- public campaign views ----------
 
 async function campaignPublic(env: Bindings, row: Record<string, any>): Promise<Record<string, any>> {
-  const raised = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(amount_cents),0) AS s, COUNT(*) AS n FROM contributions WHERE campaign_id = ? AND status = 'confirmed'"
-  ).bind(row.id).first<{ s: number; n: number }>()) ?? { s: 0, n: 0 };
+  // Single batched aggregate query instead of 4 separate ones (audit fix).
+  const agg = (await env.DB.prepare(
+    `SELECT COALESCE(SUM(amount_cents),0) AS s, COUNT(*) AS n,
+            COUNT(DISTINCT COALESCE(donor_user_id, phone)) AS d,
+            COALESCE(AVG(amount_cents),0) AS avg
+     FROM contributions WHERE campaign_id = ? AND status = 'confirmed'`
+  ).bind(row.id).first<{ s: number; n: number; d: number; avg: number }>()) ?? { s: 0, n: 0, d: 0, avg: 0 };
   const withdrawn = (await env.DB.prepare(
     "SELECT COALESCE(SUM(amount_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')"
-  ).bind(row.id).first<{ s: number }>()) ?? { s: 0 };
-  const avg = (await env.DB.prepare(
-    "SELECT COALESCE(AVG(amount_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'"
   ).bind(row.id).first<{ s: number }>()) ?? { s: 0 };
 
   const daysSince = Math.max(1, Math.floor((Date.now() - new Date(row.created_at.replace(" ", "T") + "Z").getTime()) / 86400000));
   const hasGoal = Number(row.goal_cents) > 0;
-  const remaining = hasGoal ? Math.max(0, Number(row.goal_cents) - raised.s) : null;
-  const donorsNeededAtAvg = hasGoal && avg.s > 0 ? Math.ceil(remaining! / avg.s) : null;
-  const dailyRate = Math.round(raised.s / daysSince);
+  const remaining = hasGoal ? Math.max(0, Number(row.goal_cents) - agg.s) : null;
+  const donorsNeededAtAvg = hasGoal && agg.avg > 0 ? Math.ceil(remaining! / agg.avg) : null;
+  const dailyRate = Math.round(agg.s / daysSince);
   const estDays = hasGoal && remaining! > 0 && dailyRate > 0 ? Math.ceil(remaining! / dailyRate) : null;
   const estimatedEndDate = estDays
     ? new Date(Date.now() + estDays * 86400000).toISOString().slice(0, 10)
@@ -493,14 +645,20 @@ async function campaignPublic(env: Bindings, row: Record<string, any>): Promise<
     slug: row.slug,
     title: row.title,
     description: row.description,
+    blurb: String(row.description ?? "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 140),
     imageUrl: row.image_url,
     logoUrl: row.logo_url ?? null,
     goalCents: Number(row.goal_cents),
     hasGoal: hasGoal,
-    raisedCents: raised.s,
+    raisedCents: agg.s,
     withdrawnCents: withdrawn.s,
-    donorCount: raised.n,
-    avgDonationCents: Math.round(avg.s),
+    donorCount: agg.d,
+    donationCount: agg.n,
+    avgDonationCents: Math.round(agg.avg),
     donorsNeededAtAvg: donorsNeededAtAvg,
     dailyRateCents: dailyRate,
     estimatedEndDate: estimatedEndDate,
@@ -518,6 +676,7 @@ app.get("/api/campaigns", async (c) => {
   ).all<Record<string, any>>();
   const out = [];
   for (const row of rows.results) out.push(await campaignPublic(c.env, row));
+  c.header("Cache-Control", "public, max-age=30");
   return c.json({ campaigns: out });
 });
 
@@ -527,22 +686,54 @@ app.get("/api/campaigns/:id", async (c) => {
   const pub = await campaignPublic(c.env, row);
 
   const donors = await c.env.DB.prepare(
-    `SELECT co.donor_user_id, u.username, co.donor_name, co.is_anonymous, co.hide_amount, co.amount_cents, co.created_at
+    `SELECT co.donor_user_id, u.username, u.avatar_url, co.donor_name, co.is_anonymous, co.hide_amount, co.amount_cents, co.created_at
      FROM contributions co LEFT JOIN users u ON u.id = co.donor_user_id
-     WHERE co.campaign_id = ? AND co.status = 'confirmed' ORDER BY co.created_at DESC LIMIT 50`
+     WHERE co.campaign_id = ? AND co.status = 'confirmed' ORDER BY co.created_at DESC LIMIT 100`
   ).bind(row.id).all<Record<string, any>>();
 
-  const donorList = [];
+  // Merge donations from the same donor (same phone number): one row per donor,
+  // totalling visible amounts and reporting how many donations / hidden amounts they have.
+  const merged = new Map<string, Record<string, any>>();
   for (const d of donors.results) {
-    const total = await donorTotalCents(c.env.DB, d.donor_user_id);
-    const username = d.username ?? "Giver";
+    const key = d.donor_user_id != null ? `u${d.donor_user_id}` : `p${d.phone}`;
+    const g = merged.get(key);
+    if (g) {
+      g.count += 1;
+      if (d.hide_amount) g.hidden += 1;
+      if (!d.hide_amount) g.amount += d.amount_cents;
+      if (g.latest < d.created_at) g.latest = d.created_at;
+      if (!d.is_anonymous) g.is_anonymous = false;
+      if (!d.is_anonymous && d.donor_name) g.name = d.donor_name;
+    } else {
+      merged.set(key, {
+        donor_user_id: d.donor_user_id,
+        username: d.username ?? "Giver",
+        avatar_url: d.avatar_url ?? null,
+        name: d.is_anonymous ? null : (d.donor_name ?? null),
+        is_anonymous: !!d.is_anonymous,
+        amount: d.hide_amount ? 0 : d.amount_cents,
+        visible: d.hide_amount ? 0 : 1,
+        count: 1,
+        hidden: d.hide_amount ? 1 : 0,
+        latest: d.created_at,
+      });
+    }
+  }
+
+  const donorList = [];
+  for (const g of merged.values()) {
+    const total = await donorVisibleCents(c.env.DB, g.donor_user_id);
+    const allHidden = g.visible === 0;
     donorList.push({
-      username,
-      name: d.is_anonymous ? null : (d.donor_name ?? null),
-      isAnonymous: !!d.is_anonymous,
-      amountCents: d.hide_amount ? null : d.amount_cents,
-      tier: d.hide_amount ? null : tierFor(total),
-      date: d.created_at,
+      username: g.username,
+      avatarUrl: g.is_anonymous ? null : (g.avatar_url ?? null),
+      name: allHidden ? null : (g.name ?? null),
+      isAnonymous: g.is_anonymous,
+      amountCents: allHidden ? null : g.amount,
+      tier: allHidden ? null : tierFor(total),
+      date: g.latest,
+      donationCount: g.count,
+      hiddenCount: g.hidden,
     });
   }
 
@@ -553,6 +744,18 @@ app.get("/api/campaigns/:id", async (c) => {
      GROUP BY co.donor_user_id ORDER BY total DESC LIMIT 5`
   ).bind(row.id).all<Record<string, any>>();
 
+  return c.json({
+    campaign: pub,
+    donors: donorList,
+    leaderboard: leaderboard.results.map((l) => ({
+      username: l.username ?? "Giver",
+      totalCents: l.total,
+      tier: tierFor(l.total),
+    })),
+    fees: feeConfigPublic(loadFeeConfig(c.env)),
+  });
+  // Short cache so donation totals update quickly but list/detail reads don't hammer D1.
+  c.header("Cache-Control", "public, max-age=15");
   return c.json({
     campaign: pub,
     donors: donorList,
@@ -611,7 +814,7 @@ app.post("/api/campaigns", async (c) => {
   const title = String(body.title ?? "").trim();
   const description = String(body.description ?? "").trim();
   const goalCents = Math.round(Number(body.goalCents) || 0);
-  const minWithdrawCents = Math.round(Number(body.minWithdrawCents) || 20000);
+  const minWithdrawCents = Math.round(Number(body.minWithdrawCents) || 1000);
   const minSponsors = Math.max(1, Math.round(Number(body.minSponsors) || 1));
   if (!title || !description) return c.json({ error: "Title and description are required" }, 400);
 
@@ -727,6 +930,7 @@ app.get("/api/contributions/status/:referenceId", async (c) => {
   }
   return c.json({
     referenceId,
+    id: row.id,
     status: row.status,
     amountCents: row.amount_cents,
   });
@@ -748,6 +952,35 @@ app.post("/api/device/token", async (c) => {
   ).bind(token, user.sub).run();
 
   return c.json({ ok: true });
+});
+
+// ---------- account deletion (Google Play compliance) ----------
+
+app.delete("/api/account", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const hosted = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM campaigns WHERE host_user_id = ? AND status = 'active'"
+  ).bind(user.sub).first<{ n: number }>();
+  if ((hosted?.n ?? 0) > 0) {
+    return c.json({ error: "End or close your active campaigns before deleting your account." }, 400);
+  }
+
+  await c.env.DB.batch([
+    // Personal data: erase pledges, links, OTP records, FCM token, campaigns references.
+    c.env.DB.prepare("DELETE FROM recurring_pledges WHERE user_id = ?").bind(user.sub),
+    c.env.DB.prepare("DELETE FROM user_links WHERE user_id = ? OR linked_user_id = ?").bind(user.sub, user.sub),
+    c.env.DB.prepare("DELETE FROM otps WHERE phone = ?").bind(user.phone),
+    c.env.DB.prepare("UPDATE campaigns SET host_user_id = NULL WHERE host_user_id = ?").bind(user.sub),
+    // Financial records are retained for compliance, but stripped of personal identity.
+    c.env.DB.prepare(
+      "UPDATE contributions SET donor_user_id = NULL, donor_name = NULL, is_anonymous = 1 WHERE donor_user_id = ?"
+    ).bind(user.sub),
+    c.env.DB.prepare("DELETE FROM users WHERE id = ?").bind(user.sub),
+  ]);
+
+  return c.json({ ok: true, message: "Account deleted." });
 });
 
 // ---------- recurring pledges ----------
@@ -991,6 +1224,78 @@ app.get("/api/campaigns/:id/group-status", async (c) => {
   });
 });
 
+// ---------- host announcements ----------
+
+app.get("/api/campaigns/:id/announcements", async (c) => {
+  const campaign = await c.env.DB.prepare("SELECT id, status FROM campaigns WHERE id = ?")
+    .bind(c.req.param("id")).first<{ id: number; status: string }>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.status === "draft") return c.json({ error: "Campaign not found" }, 404);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT a.id, a.body, a.created_at, u.username AS author
+     FROM announcements a LEFT JOIN users u ON u.id = a.user_id
+     WHERE a.campaign_id = ? ORDER BY a.created_at DESC LIMIT 50`
+  ).bind(campaign.id).all<Record<string, any>>();
+
+  return c.json({
+    announcements: rows.results.map((a) => ({
+      id: a.id,
+      body: a.body,
+      author: a.username ?? "Host",
+      createdAt: a.created_at,
+    })),
+  });
+});
+
+app.post("/api/campaigns/:id/announcements", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT * FROM campaigns WHERE id = ?"
+  ).bind(c.req.param("id")).first<Record<string, any>>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+
+  const me = await c.env.DB.prepare("SELECT is_admin, is_host, host_status FROM users WHERE id = ?")
+    .bind(user.sub).first<Record<string, any>>();
+  const isHost = campaign.host_user_id === user.sub && me?.host_status === "approved";
+  if (!isHost && me?.is_admin !== 1) {
+    return c.json({ error: "Only the campaign host can post announcements" }, 403);
+  }
+
+  const body = await c.req.json();
+  const text = String(body.body ?? "").trim();
+  if (!text || text.length > 500) {
+    return c.json({ error: "Announcement must be 1-500 characters" }, 400);
+  }
+
+  const r = await c.env.DB.prepare(
+    "INSERT INTO announcements (campaign_id, user_id, body) VALUES (?, ?, ?)"
+  ).bind(campaign.id, user.sub, text).run();
+
+  // Push to every confirmed donor of this campaign with an FCM token.
+  if (envPushConfigured(c.env)) {
+    const donors = await c.env.DB.prepare(
+      `SELECT DISTINCT u.fcm_token FROM contributions co
+       JOIN users u ON u.id = co.donor_user_id
+       WHERE co.campaign_id = ? AND co.status = 'confirmed' AND u.fcm_token IS NOT NULL`
+    ).bind(campaign.id).all<{ fcm_token: string }>();
+    const tokens = donors.results.map((d) => d.fcm_token);
+    if (tokens.length) {
+      await sendMulticastPush(
+        { FIREBASE_CLIENT_EMAIL: c.env.FIREBASE_CLIENT_EMAIL!, FIREBASE_PRIVATE_KEY: c.env.FIREBASE_PRIVATE_KEY! },
+        tokens,
+        `${campaign.title} update`,
+        text.slice(0, 100),
+        { type: "announcement", campaignId: String(campaign.id) }
+      ).catch((e) => console.error("announcement push failed:", e));
+    }
+  }
+
+  return c.json({ ok: true, id: r.meta.last_row_id, createdAt: new Date().toISOString() });
+});
+
 // ---------- Couple/Family Account Linking ----------
 
 app.post("/api/user/link", async (c) => {
@@ -1022,8 +1327,9 @@ app.post("/api/user/link", async (c) => {
   ).bind(user.sub, target.id, linkType).run();
 
   // Send SMS to target user
+  const me = await c.env.DB.prepare("SELECT username FROM users WHERE id = ?").bind(user.sub).first<{ username: string }>();
   await sendSms(c.env, target.phone,
-    `${user.username} wants to link accounts as ${linkType}. Open Kingdom Sponsor to accept.`
+    `${me?.username ?? "A Kingdom Sponsor user"} wants to link accounts as ${linkType}. Open Kingdom Sponsor to accept.`
   ).catch((e) => console.error("link sms failed:", e));
 
   return c.json({ ok: true, message: "Link request sent. Waiting for acceptance." });
@@ -1034,10 +1340,11 @@ app.get("/api/user/links", async (c) => {
   if (!user) return c.json({ error: "Not authenticated" }, 401);
 
   const rows = await c.env.DB.prepare(
-    `SELECT ul.*, u.username AS linked_username, u.phone AS linked_phone
-     FROM user_links ul JOIN users u ON u.id = ul.linked_user_id
+    `SELECT ul.*, u.username AS other_username, u.phone AS other_phone
+     FROM user_links ul
+     JOIN users u ON u.id = CASE WHEN ul.linked_user_id = ? THEN ul.user_id ELSE ul.linked_user_id END
      WHERE ul.user_id = ? OR ul.linked_user_id = ?`
-  ).bind(user.sub, user.sub).all<Record<string, any>>();
+  ).bind(user.sub, user.sub, user.sub).all<Record<string, any>>();
 
   return c.json({
     links: rows.results.map((l) => ({
@@ -1046,9 +1353,9 @@ app.get("/api/user/links", async (c) => {
       status: l.status,
       isInitiator: l.user_id === user.sub,
       otherUser: {
-        userId: l.linked_user_id,
-        username: l.linked_username,
-        phone: l.linked_phone,
+        userId: l.user_id === user.sub ? l.linked_user_id : l.user_id,
+        username: l.other_username ?? "Giver",
+        phone: l.other_phone ?? "",
       },
       createdAt: l.created_at,
     })),
@@ -1119,8 +1426,8 @@ app.post("/api/campaigns/:id/promote", async (c) => {
     return c.json({ error: "All promotion slots are taken. Wait for a slot to open." }, 409);
   }
 
-  const price = promoPrice(c.env);
-  const days = promoDays(c.env);
+  const price = await promoPrice(c.env);
+  const days = await promoDays(c.env);
   const referenceId = `PRO-${campaign.id}-${Date.now()}`;
 
   const r = await c.env.DB.prepare(
@@ -1158,16 +1465,81 @@ app.get("/api/promotions/info", async (c) => {
     slots,
     active,
     available: Math.max(0, slots - active),
-    priceCents: promoPrice(c.env),
-    days: promoDays(c.env),
+    priceCents: await promoPrice(c.env),
+    days: await promoDays(c.env),
     promotedIds: (await c.env.DB.prepare("SELECT id FROM campaigns WHERE promoted = 1").all()).results.map((r: any) => r.id),
+  });
+});
+
+// ---------- superadmin promotion settings (paywall) ----------
+
+app.get("/api/admin/promotion-config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  return c.json({
+    priceCents: await promoPrice(c.env),
+    days: await promoDays(c.env),
+    slots: PROMO_SLOTS,
+  });
+});
+
+app.post("/api/admin/promotion-config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json();
+  const price = Math.round(Number(body.priceCents));
+  const days = Math.round(Number(body.days));
+  if (!Number.isFinite(price) || price < 1000 || price > 200000) {
+    return c.json({ error: "Price must be between K10 and K2,000." }, 400);
+  }
+  if (!Number.isFinite(days) || days < 1 || days > 30) {
+    return c.json({ error: "Days must be between 1 and 30." }, 400);
+  }
+
+  await c.env.DB.batch([
+    envDB(c).prepare("INSERT INTO app_settings (key, value) VALUES ('promo_price_cents', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(String(price)),
+    envDB(c).prepare("INSERT INTO app_settings (key, value) VALUES ('promo_days', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(String(days)),
+  ]);
+  return c.json({ ok: true, priceCents: price, days });
+});
+
+function envDB(c: any): D1Database {
+  return c.env.DB;
+}
+
+// Host's own promotion history (paid + pending + rejected).
+app.get("/api/me/promotions", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT p.*, c.title AS campaign_title
+     FROM promotions p JOIN campaigns c ON c.id = p.campaign_id
+     WHERE c.host_user_id = ? ORDER BY p.created_at DESC LIMIT 20`
+  ).bind(user.sub).all<Record<string, any>>();
+
+  return c.json({
+    promotions: rows.results.map((p) => ({
+      id: p.id,
+      campaignId: p.campaign_id,
+      campaignTitle: p.campaign_title,
+      amountCents: p.amount_cents,
+      days: p.days,
+      status: p.status,
+      reference: p.lipila_reference,
+      expiresAt: p.expires_at,
+      createdAt: p.created_at,
+    })),
   });
 });
 
 // ---------- PDF receipts ----------
 
 interface ReceiptInput {
+  receiptNumber: string;
   donorName: string;
+  donorPhone: string;
   campaignTitle: string;
   amountCents: number;
   platformFeeCents: number;
@@ -1184,52 +1556,66 @@ async function buildReceiptPdf(i: ReceiptInput): Promise<Uint8Array> {
   const page = doc.addPage([540, 720]);
   const { width } = page.getSize();
 
-  let y = 660;
-  page.drawText("Kingdom Sponsor", { x: 50, y, size: 24, font: bold, color: rgb(0.12, 0.38, 0.72) });
-  y -= 26;
-  page.drawText("Donation Receipt", { x: 50, y, size: 16, font: bold });
+  // Header band
   page.drawRectangle({
-    x: 50, y: y - 8, width: width - 100, height: 1,
+    x: 0, y: page.getSize().height - 80, width: width, height: 80,
+    color: rgb(0.12, 0.38, 0.72),
+  });
+  page.drawText("Kingdom Sponsor", { x: 50, y: page.getSize().height - 30, size: 22, font: bold, color: rgb(1, 1, 1) });
+  page.drawText("Official Donation Receipt", { x: 50, y: page.getSize().height - 52, size: 13, font, color: rgb(0.9, 0.9, 0.95) });
+
+  let y = page.getSize().height - 100;
+  page.drawRectangle({
+    x: 50, y: y - 4, width: width - 100, height: 1,
     color: rgb(0.8, 0.85, 0.92),
   });
+  y -= 20;
 
-  y -= 46;
   const row = (label: string, value: string) => {
     page.drawText(label, { x: 50, y, size: 11, font });
     page.drawText(value, { x: 240, y, size: 11, font: bold });
-    y -= 22;
+    y -= 20;
   };
 
+  row("Receipt no.", i.receiptNumber);
   row("Donor", i.donorName);
+  row("Donor phone", i.donorPhone);
   row("Campaign", i.campaignTitle);
   row("Reference", i.reference);
-  row("Date", new Date(i.date).toLocaleDateString());
+  row("Date", new Date(i.date).toLocaleDateString("en-ZM", { year: 'numeric', month: 'long', day: 'numeric' }));
   row("Status", i.status === "confirmed" ? "Confirmed" : i.status);
 
-  y -= 10;
-  row("Total donated", `K${(i.amountCents / 100).toLocaleString()}`);
+  y -= 8;
+  page.drawRectangle({
+    x: 50, y: y - 4, width: width - 100, height: 1,
+    color: rgb(0.8, 0.85, 0.92),
+  });
+  y -= 24;
+  page.drawText("Amount donated:", { x: 50, y, size: 12, font: bold, color: rgb(0.12, 0.38, 0.72) });
+  page.drawText(`K${(i.amountCents / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, { x: 330, y, size: 12, font: bold });
+
+  y -= 20;
+  page.drawText("Processing fee (payment gateway + platform):", { x: 50, y, size: 10, font, color: rgb(0.5, 0.5, 0.5) });
+  y -= 16;
+  const processingFee = i.platformFeeCents + i.lipilaFeeCents;
+  page.drawText(`K${(processingFee / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, { x: 330, y, size: 10, font: bold });
 
   y -= 16;
   page.drawRectangle({
-    x: 50, y: y - 6, width: width - 100, height: 1,
+    x: 50, y: y - 4, width: width - 100, height: 1,
     color: rgb(0.8, 0.85, 0.92),
   });
-  y -= 28;
-  page.drawText("Platform fee (charged to donors):", { x: 50, y, size: 10, font });
-  page.drawText(`K${(i.platformFeeCents / 100).toLocaleString()}`, { x: 330, y, size: 10, font: bold });
-  y -= 18;
-  page.drawText("Gateway fee:", { x: 50, y, size: 10, font });
-  page.drawText(`K${(i.lipilaFeeCents / 100).toLocaleString()}`, { x: 330, y, size: 10, font: bold });
+  y -= 22;
+  const received = i.amountCents - processingFee;
+  page.drawText("Campaign receives:", { x: 50, y, size: 11, font: bold, color: rgb(0.12, 0.38, 0.72) });
+  page.drawText(`K${(received / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, { x: 240, y, size: 11, font: bold });
 
-  y -= 30;
-  const received = i.amountCents - i.platformFeeCents - i.lipilaFeeCents;
-  page.drawText("Campaign receives:", { x: 50, y, size: 11, font: bold });
-  page.drawText(`K${(received / 100).toLocaleString()}`, { x: 240, y, size: 11, font: bold });
-
-  y -= 60;
+  y -= 50;
   page.drawText("Thank you for giving to Zambia.", { x: 50, y, size: 10, font });
-  y -= 16;
-  page.drawText("This receipt was issued automatically. It can be used for records.", { x: 50, y, size: 9, font, color: rgb(0.45, 0.5, 0.55) });
+  y -= 14;
+  page.drawText("This receipt was issued automatically and records your gift for your records.", { x: 50, y, size: 9, font, color: rgb(0.45, 0.5, 0.55) });
+  y -= 12;
+  page.drawText("Kingdom Sponsor  •  kingdom-sponsor.app  •  Built with purpose", { x: 50, y, size: 8, font, color: rgb(0.6, 0.6, 0.6) });
 
   return doc.save();
 }
@@ -1256,9 +1642,16 @@ app.get("/api/contributions/:id/receipt", async (c) => {
     return c.json({ error: "Not your receipt" }, 403);
   }
 
+  // Track the download for growth stats (every generation counts as a download).
+  await c.env.DB.prepare(
+    "INSERT INTO receipt_downloads (contribution_id, downloaded_by, phone) VALUES (?, ?, ?)"
+  ).bind(row.id, user.sub, user.phone).run();
+
   const donorName = row.is_anonymous ? "Anonymous" : (String(row.donor_name ?? "").trim() || "Anonymous");
   const pdf = await buildReceiptPdf({
+    receiptNumber: `KS-${String(row.id).padStart(6, "0")}`,
     donorName,
+    donorPhone: row.phone,
     campaignTitle: row.campaign_title,
     amountCents: row.amount_cents,
     platformFeeCents: row.platform_fee_cents,
@@ -1269,8 +1662,287 @@ app.get("/api/contributions/:id/receipt", async (c) => {
   });
   return new Response(pdf, {
     status: 200,
-    headers: { "Content-Type": "application/pdf", "Cache-Control": "no-store" },
+    headers: {
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="kingdom-sponsor-receipt-${row.id}.pdf"`,
+      "Cache-Control": "no-store",
+    },
   });
+});
+
+/** Donor's own confirmed contributions (for the "My receipts" screen). */
+app.get("/api/me/receipts", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT co.id, co.amount_cents, co.lipila_reference, co.confirmed_at, co.created_at,
+            cam.title AS campaign_title
+     FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
+     WHERE co.phone = ? AND co.status = 'confirmed'
+     ORDER BY co.confirmed_at DESC LIMIT 100`
+  ).bind(user.phone).all<Record<string, any>>();
+
+  return c.json({
+    receipts: rows.results.map((r) => ({
+      id: r.id,
+      campaignTitle: r.campaign_title,
+      amountCents: r.amount_cents,
+      reference: r.lipila_reference,
+      date: r.confirmed_at ?? r.created_at,
+    })),
+  });
+});
+
+// ---------- support tickets ----------
+
+app.post("/api/support/tickets", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const body = await c.req.json();
+  const subject = String(body.subject ?? "").trim();
+  const message = String(body.message ?? "").trim();
+  if (!subject || subject.length > 120) return c.json({ error: "Subject is required (max 120 characters)." }, 400);
+  if (!message || message.length > 2000) return c.json({ error: "Message is required (max 2000 characters)." }, 400);
+
+  const r = await c.env.DB.prepare(
+    "INSERT INTO support_tickets (user_id, phone, subject, message) VALUES (?, ?, ?, ?)"
+  ).bind(user.sub, user.phone, subject, message).run();
+  const ticketId = Number(r.meta.last_row_id);
+
+  // Notify the superadmin(s) so tickets are answered fast.
+  await pushAndSmsAdmins(c.env, supportReceivedSms(ticketId, subject),
+    "New support request", `#${ticketId}: ${subject}`).catch(() => {});
+
+  return c.json({ ok: true, id: ticketId });
+});
+
+app.get("/api/support/tickets", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT id, subject, message, status, admin_reply, created_at, updated_at
+     FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`
+  ).bind(user.sub).all<Record<string, any>>();
+
+  return c.json({
+    tickets: rows.results.map((t) => ({
+      id: t.id,
+      subject: t.subject,
+      message: t.message,
+      status: t.status,
+      adminReply: t.admin_reply,
+      createdAt: t.created_at,
+      updatedAt: t.updated_at,
+    })),
+  });
+});
+
+app.post("/api/support/tickets/:id/reply", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const body = await c.req.json();
+  const text = String(body.message ?? "").trim();
+  if (!text || text.length > 2000) return c.json({ error: "Message is required (max 2000 characters)." }, 400);
+
+  const ticket = await c.env.DB.prepare(
+    "SELECT * FROM support_tickets WHERE id = ?"
+  ).bind(c.req.param("id")).first<Record<string, any>>();
+  if (!ticket) return c.json({ error: "Ticket not found" }, 404);
+
+  const me = await c.env.DB.prepare("SELECT is_admin FROM users WHERE id = ?")
+    .bind(user.sub).first<{ is_admin: number | null }>();
+
+  if (me?.is_admin === 1) {
+    // Admin answers: mark answered and notify the user.
+    await c.env.DB.prepare(
+      "UPDATE support_tickets SET admin_reply = ?, status = 'answered', updated_at = datetime('now', '+2 hours') WHERE id = ?"
+    ).bind(text, ticket.id).run();
+    await sendSms(c.env, ticket.phone, supportReplySms(ticket.subject))
+      .catch((e) => console.error("ticket reply sms failed:", e));
+    await pushToUser(c.env, ticket.user_id, "Support replied",
+      `Your request "${ticket.subject}" has a new reply.`, { type: "ticket_reply", ticketId: String(ticket.id) })
+      .catch((e) => console.error("ticket reply push failed:", e));
+  } else {
+    // User replies: reopen the ticket.
+    if (ticket.user_id !== user.sub) return c.json({ error: "Not your ticket" }, 403);
+    await c.env.DB.prepare(
+      "UPDATE support_tickets SET message = ?, status = 'open', updated_at = datetime('now', '+2 hours') WHERE id = ?"
+    ).bind(text, ticket.id).run();
+    await pushAndSmsAdmins(c.env, supportReceivedSms(ticket.id, `re: ${ticket.subject}`),
+      "Ticket reopened", `#${ticket.id}: ${ticket.subject}`).catch(() => {});
+  }
+
+  return c.json({ ok: true });
+});
+
+app.get("/api/admin/tickets", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const status = String(c.req.query("status") ?? "").toLowerCase();
+  const rows = await c.env.DB.prepare(
+    `SELECT t.*, u.username
+     FROM support_tickets t LEFT JOIN users u ON u.id = t.user_id
+     WHERE (? = '' OR lower(t.status) = ?)
+     ORDER BY t.created_at DESC LIMIT 200`
+  ).bind(status, status).all<Record<string, any>>();
+
+  return c.json({
+    tickets: rows.results.map((t) => ({
+      id: t.id,
+      phone: t.phone,
+      username: t.username ?? null,
+      subject: t.subject,
+      message: t.message,
+      status: t.status,
+      adminReply: t.admin_reply,
+      createdAt: t.created_at,
+      updatedAt: t.updated_at,
+    })),
+  });
+});
+
+// ---------- campaign deletion (admin only) + host delete requests ----------
+
+app.post("/api/campaigns/:id/delete-request", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ? AND host_user_id = ?")
+    .bind(c.req.param("id"), user.sub).first<Record<string, any>>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.status === "deleted") return c.json({ error: "Campaign already deleted." }, 400);
+
+  const existing = await c.env.DB.prepare(
+    "SELECT id FROM campaign_delete_requests WHERE campaign_id = ? AND status = 'pending'"
+  ).bind(campaign.id).first<Record<string, any>>();
+  if (existing) return c.json({ error: "A delete request is already pending." }, 409);
+
+  const body = await c.req.json().catch(() => ({}));
+  const reason = String(body.reason ?? "").trim().slice(0, 500);
+
+  await c.env.DB.prepare(
+    "INSERT INTO campaign_delete_requests (campaign_id, reason) VALUES (?, ?)"
+  ).bind(campaign.id, reason || null).run();
+
+  await sendSms(c.env, user.phone, deleteRequestReceivedSms(campaign.title))
+    .catch((e) => console.error("delete-request sms failed:", e));
+  await pushToUser(c.env, user.sub, "Delete request received",
+    `We'll review your request to remove "${campaign.title}".`, { type: "delete_request", campaignId: String(campaign.id) })
+    .catch((e) => console.error("delete-request push failed:", e));
+  await pushAndSmsAdmins(c.env, `New delete request for campaign "${campaign.title}".`,
+    "Campaign delete request", `"${campaign.title}" wants to be removed.`).catch(() => {});
+
+  return c.json({ ok: true });
+});
+
+app.get("/api/admin/delete-requests", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT dr.id, dr.campaign_id, dr.reason, dr.status, dr.created_at,
+            cam.title AS campaign_title, u.phone AS host_phone, u.username AS host_username
+     FROM campaign_delete_requests dr
+     JOIN campaigns cam ON cam.id = dr.campaign_id
+     LEFT JOIN users u ON u.id = cam.host_user_id
+     WHERE dr.status = 'pending' ORDER BY dr.created_at ASC LIMIT 100`
+  ).all<Record<string, any>>();
+
+  return c.json({
+    requests: rows.results.map((r) => ({
+      id: r.id,
+      campaignId: r.campaign_id,
+      campaignTitle: r.campaign_title,
+      reason: r.reason,
+      status: r.status,
+      hostPhone: r.host_phone,
+      hostUsername: r.host_username,
+      createdAt: r.created_at,
+    })),
+  });
+});
+
+/** Soft-delete a campaign (financial records are kept for compliance; campaign becomes invisible). */
+async function deleteCampaign(env: Bindings, campaignId: number): Promise<void> {
+  const campaign = await env.DB.prepare(
+    "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(campaignId).first<Record<string, any>>();
+  if (!campaign) return;
+
+  await env.DB.batch([
+    env.DB.prepare("UPDATE campaigns SET status = 'deleted', promoted = 0 WHERE id = ?").bind(campaignId),
+    env.DB.prepare("UPDATE promotions SET status = 'cancelled' WHERE campaign_id = ? AND status IN ('pending','pending_approval','active')").bind(campaignId),
+  ]);
+
+  if (campaign.host_phone) {
+    await sendSms(env, campaign.host_phone, campaignDeletedSms(campaign.title))
+      .catch((e) => console.error("campaign-deleted sms failed:", e));
+    await pushToUser(env, campaign.host_user_id, "Campaign removed",
+      `"${campaign.title}" has been removed from Kingdom Sponsor.`, { type: "campaign_deleted", campaignId: String(campaignId) })
+      .catch((e) => console.error("campaign-deleted push failed:", e));
+  }
+}
+
+app.post("/api/admin/campaigns/:id/delete", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
+    .bind(c.req.param("id")).first<Record<string, any>>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.status === "deleted") return c.json({ error: "Campaign already deleted." }, 400);
+
+  await deleteCampaign(c.env, campaign.id);
+  await c.env.DB.prepare(
+    "UPDATE campaign_delete_requests SET status = 'approved', resolved_at = datetime('now', '+2 hours') WHERE campaign_id = ? AND status = 'pending'"
+  ).bind(campaign.id).run();
+
+  return c.json({ ok: true });
+});
+
+app.post("/api/admin/delete-requests/:id/approve", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const req = await c.env.DB.prepare("SELECT * FROM campaign_delete_requests WHERE id = ? AND status = 'pending'")
+    .bind(c.req.param("id")).first<Record<string, any>>();
+  if (!req) return c.json({ error: "Request not found" }, 404);
+
+  await deleteCampaign(c.env, req.campaign_id);
+  await c.env.DB.prepare(
+    "UPDATE campaign_delete_requests SET status = 'approved', resolved_at = datetime('now', '+2 hours') WHERE id = ?"
+  ).bind(req.id).run();
+  return c.json({ ok: true });
+});
+
+app.post("/api/admin/delete-requests/:id/reject", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const req = await c.env.DB.prepare("SELECT * FROM campaign_delete_requests WHERE id = ? AND status = 'pending'")
+    .bind(c.req.param("id")).first<Record<string, any>>();
+  if (!req) return c.json({ error: "Request not found" }, 404);
+
+  await c.env.DB.prepare(
+    "UPDATE campaign_delete_requests SET status = 'rejected', resolved_at = datetime('now', '+2 hours') WHERE id = ?"
+  ).bind(req.id).run();
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT c.title, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(req.campaign_id).first<Record<string, any>>();
+  if (campaign?.host_phone) {
+    await sendSms(c.env, campaign.host_phone, deleteRequestRejectedSms(campaign.title))
+      .catch((e) => console.error("delete-reject sms failed:", e));
+    await pushToUser(c.env, campaign.host_user_id, "Delete request declined",
+      `Your request to remove "${campaign.title}" was declined.`, { type: "delete_request_rejected", campaignId: String(req.campaign_id) })
+      .catch((e) => console.error("delete-reject push failed:", e));
+  }
+  return c.json({ ok: true });
 });
 
 // ---------- Lipila webhook (async confirmations + payout results) ----------
@@ -1370,7 +2042,7 @@ app.get("/api/host/me", async (c) => {
   const totalGiven = await donorTotalCents(c.env.DB, user.sub);
 
   const campaigns = await c.env.DB.prepare(
-    "SELECT * FROM campaigns WHERE host_user_id = ? ORDER BY created_at DESC"
+    "SELECT * FROM campaigns WHERE host_user_id = ? AND status != 'deleted' ORDER BY created_at DESC"
   ).bind(user.sub).all<Record<string, any>>();
   const out = [];
   for (const row of campaigns.results) {
@@ -1380,9 +2052,9 @@ app.get("/api/host/me", async (c) => {
 
   const transactions = await c.env.DB.prepare(
     `SELECT co.id, co.campaign_id, c.title AS campaign_title, co.donor_name, co.is_anonymous, co.phone, co.amount_cents,
-            co.platform_fee_cents, co.lipila_fee_cents, co.status, co.created_at
+            co.platform_fee_cents, co.lipila_fee_cents, co.status, co.lipila_reference, co.created_at
      FROM contributions co JOIN campaigns c ON c.id = co.campaign_id
-     WHERE c.host_user_id = ? ORDER BY co.created_at DESC LIMIT 100`
+     WHERE c.host_user_id = ? AND co.status = 'confirmed' ORDER BY co.created_at DESC LIMIT 100`
   ).bind(user.sub).all<Record<string, any>>();
 
   return c.json({
@@ -1390,6 +2062,8 @@ app.get("/api/host/me", async (c) => {
       id: user.sub,
       phone: user.phone,
       username: me.username ?? "Giver",
+      name: me.name ?? null,
+      avatarUrl: me.avatar_url ?? null,
       isHost: user.isHost,
       isAdmin: isAdminPhone(c.env, user.phone),
       hostStatus: me.host_status ?? "none",
@@ -1411,6 +2085,51 @@ app.get("/api/host/me", async (c) => {
       status: t.status,
       date: t.created_at,
     })),
+  });
+});
+
+// ---------- profile: edit display name / username ----------
+
+app.post("/api/me", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const me = (await c.env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(user.sub).first<Record<string, any>>()) ?? {};
+  const body = await c.req.json();
+
+  const name = String(body.name ?? "").trim();
+  if (name.length > 60) {
+    return c.json({ error: "Name must be 60 characters or fewer" }, 400);
+  }
+
+  let username: string | null = null;
+  if (typeof body.username === "string" && body.username.trim() !== "") {
+    username = String(body.username).trim();
+    if (username.length < 3 || username.length > 24 || !/^[A-Za-z0-9_]+$/.test(username)) {
+      return c.json({ error: "Username must be 3-24 letters, numbers or underscores" }, 400);
+    }
+    const clash = await c.env.DB.prepare(
+      "SELECT id FROM users WHERE username = ? AND id != ?"
+    ).bind(username, user.sub).first();
+    if (clash) return c.json({ error: "That username is already taken" }, 400);
+  }
+
+  if (name !== (me.name ?? "") || (username !== null && username !== me.username)) {
+    await c.env.DB.prepare("UPDATE users SET name = ?, username = COALESCE(?, username) WHERE id = ?")
+      .bind(name || null, username, user.sub).run();
+  }
+
+  return c.json({
+    ok: true,
+    user: {
+      id: user.sub,
+      phone: user.phone,
+      username: username ?? me.username ?? "Giver",
+      name: name || null,
+      isHost: !!me.is_host,
+      isAdmin: isAdminPhone(c.env, user.phone),
+      hostStatus: me.host_status ?? "none",
+    },
   });
 });
 
@@ -1445,7 +2164,7 @@ app.post("/api/campaigns/:id/end", async (c) => {
   if (!campaign) return c.json({ error: "Campaign not found" }, 404);
 
   await c.env.DB.prepare(
-    "UPDATE campaigns SET status = 'ended', ended_at = datetime('now') WHERE id = ?"
+    "UPDATE campaigns SET status = 'ended', ended_at = datetime('now', '+2 hours') WHERE id = ?"
   ).bind(campaign.id).run();
 
   await createWithdrawal(c.env, campaign.id); // sweep any remainder below threshold
@@ -1534,6 +2253,34 @@ app.get("/api/admin/promotions", async (c) => {
   });
 });
 
+app.post("/api/admin/promotions/:id/approve", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const id = Number(c.req.param("id"));
+  const promo = await c.env.DB.prepare(
+    "SELECT * FROM promotions WHERE id = ? AND status = 'pending_approval'"
+  ).bind(id).first<Record<string, any>>();
+  if (!promo) return c.json({ error: "No pending promotion with that id" }, 404);
+
+  await approvePromotion(c.env, id);
+  return c.json({ ok: true, message: "Promotion approved and now live." });
+});
+
+app.post("/api/admin/promotions/:id/reject", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const id = Number(c.req.param("id"));
+  const promo = await c.env.DB.prepare(
+    "SELECT * FROM promotions WHERE id = ? AND status = 'pending_approval'"
+  ).bind(id).first<Record<string, any>>();
+  if (!promo) return c.json({ error: "No pending promotion with that id" }, 404);
+
+  await rejectPromotion(c.env, id);
+  return c.json({ ok: true, message: "Promotion rejected. The host has been notified." });
+});
+
 app.get("/api/admin/stats", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
@@ -1553,6 +2300,28 @@ app.get("/api/admin/stats", async (c) => {
   const pending = (await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM users WHERE host_status = 'pending'"
   ).first<{ n: number }>()) ?? { n: 0 };
+
+  // Growth + activity counters (7d/30d windows). Indexed via created_at columns.
+  const [users, campaigns, donations, receipts, pledges, tickets, deleteReqs] = await c.env.DB.batch([
+    c.env.DB.prepare(
+      "SELECT (SELECT COUNT(*) FROM users) AS total, (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-30 days')) AS d30"
+    ),
+    c.env.DB.prepare(
+      "SELECT (SELECT COUNT(*) FROM campaigns WHERE status != 'deleted') AS total, (SELECT COUNT(*) FROM campaigns WHERE created_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM campaigns WHERE created_at >= datetime('now', '-30 days')) AS d30"
+    ),
+    c.env.DB.prepare(
+      "SELECT (SELECT COUNT(*) FROM contributions WHERE status = 'confirmed') AS total, (SELECT COUNT(*) FROM contributions WHERE status = 'confirmed' AND confirmed_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM contributions WHERE status = 'confirmed' AND confirmed_at >= datetime('now', '-30 days')) AS d30"
+    ),
+    c.env.DB.prepare(
+      "SELECT (SELECT COUNT(*) FROM receipt_downloads) AS total, (SELECT COUNT(*) FROM receipt_downloads WHERE created_at >= datetime('now', '-7 days')) AS d7, (SELECT COUNT(*) FROM receipt_downloads WHERE created_at >= datetime('now', '-30 days')) AS d30"
+    ),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM recurring_pledges WHERE active = 1"),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM support_tickets WHERE status = 'open'"),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM campaign_delete_requests WHERE status = 'pending'"),
+  ]);
+  const rc = (r: any) => (r?.results?.[0] ?? r?.[0] ?? {});
+  const usersRow = rc(users), campaignsRow = rc(campaigns), donationsRow = rc(donations),
+    receiptsRow = rc(receipts), pledgesRow = rc(pledges), ticketsRow = rc(tickets), deleteReqsRow = rc(deleteReqs);
 
   const firstCampaign = await c.env.DB.prepare(
     "SELECT created_at FROM campaigns ORDER BY created_at ASC LIMIT 1"
@@ -1595,10 +2364,24 @@ app.get("/api/admin/stats", async (c) => {
       donors: total.d,
       platformFeesCents: platformFees.s + payoutPlatformFees.s,
       platformFeesSettledCents: feeSettled,
-      platformFeesPendingCents: platformFees.s - feeSettled,
+      platformFeesPendingCents: (platformFees.s + payoutPlatformFees.s) - feeSettled,
       activeCampaigns: activeCampaigns.n,
       pendingApplications: pending.n,
       dailyRateCents: Math.round(total.s / days),
+      usersTotal: usersRow.total ?? 0,
+      newUsers7d: usersRow.d7 ?? 0,
+      newUsers30d: usersRow.d30 ?? 0,
+      campaignsTotal: campaignsRow.total ?? 0,
+      newCampaigns7d: campaignsRow.d7 ?? 0,
+      newCampaigns30d: campaignsRow.d30 ?? 0,
+      donationsTotal: donationsRow.total ?? 0,
+      newDonations7d: donationsRow.d7 ?? 0,
+      newDonations30d: donationsRow.d30 ?? 0,
+      receiptsDownloaded: receiptsRow.total ?? 0,
+      receiptsDownloaded7d: receiptsRow.d7 ?? 0,
+      activePledges: pledgesRow.n ?? 0,
+      openTickets: ticketsRow.n ?? 0,
+      pendingDeleteRequests: deleteReqsRow.n ?? 0,
     },
     topCampaigns: topList,
     topDonors: topDonors.results.map((d) => ({
@@ -1623,14 +2406,16 @@ app.get("/api/admin/transactions", async (c) => {
   if (!admin) return c.json({ error: "Admin only" }, 403);
 
   const status = String(c.req.query("status") ?? "").toLowerCase();
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "500", 10) || 500, 1), 1000);
+  const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
   const rows = await c.env.DB.prepare(
     `SELECT co.id, co.campaign_id, cam.title AS campaign_title, co.donor_name, co.is_anonymous,
             co.phone, co.amount_cents, co.platform_fee_cents, co.lipila_fee_cents, co.status,
             co.lipila_reference, co.lipila_identifier, co.confirmed_at, co.created_at
      FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
      WHERE (? = '' OR lower(co.status) = ?)
-     ORDER BY co.created_at DESC LIMIT 500`
-  ).bind(status, status).all<Record<string, any>>();
+     ORDER BY co.created_at DESC LIMIT ? OFFSET ?`
+  ).bind(status, status, limit, offset).all<Record<string, any>>();
 
   return c.json({
     transactions: rows.results.map((t) => ({
@@ -1649,6 +2434,41 @@ app.get("/api/admin/transactions", async (c) => {
       confirmedAt: t.confirmed_at,
       createdAt: t.created_at,
     })),
+  });
+});
+
+app.get("/api/admin/transactions/:id", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const t = await c.env.DB.prepare(
+    `SELECT co.*, cam.title AS campaign_title, u.username AS donor_username
+     FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
+     LEFT JOIN users u ON u.id = co.donor_user_id
+     WHERE co.id = ?`
+  ).bind(c.req.param("id")).first<Record<string, any>>();
+  if (!t) return c.json({ error: "Transaction not found" }, 404);
+
+  return c.json({
+    transaction: {
+      id: t.id,
+      campaignId: t.campaign_id,
+      campaignTitle: t.campaign_title,
+      donorUsername: t.donor_username ?? null,
+      donorName: t.is_anonymous ? null : t.donor_name,
+      isAnonymous: !!t.is_anonymous,
+      phone: t.phone,
+      amountCents: t.amount_cents,
+      platformFeeCents: t.platform_fee_cents,
+      lipilaFeeCents: t.lipila_fee_cents,
+      payoutCents: Math.max(0, t.amount_cents - (t.platform_fee_cents ?? 0) - (t.lipila_fee_cents ?? 0)),
+      status: t.status,
+      lipilaReference: t.lipila_reference,
+      lipilaIdentifier: t.lipila_identifier,
+      confirmedAt: t.confirmed_at,
+      createdAt: t.created_at,
+      hideAmount: !!t.hide_amount,
+    },
   });
 });
 
@@ -1724,7 +2544,7 @@ const LOGO_TYPES: Record<string, string> = {
   "image/webp": "webp",
 };
 
-app.get("/media/:key", async (c) => {
+app.get("/media/:key{.+}", async (c) => {
   const key = c.req.param("key");
   if (!/^[a-zA-Z0-9/_.-]+$/.test(key)) return c.json({ error: "Not found" }, 404);
   const obj = await c.env.MEDIA.get(key);
@@ -1736,6 +2556,30 @@ app.get("/media/:key", async (c) => {
     "Cache-Control": "public, max-age=86400, immutable",
   });
   return new Response(obj.body, { headers });
+});
+
+// ---------- donor profile photos ----------
+
+app.post("/api/me/avatar", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "Upload an image" }, 400);
+
+  const type = file.type.toLowerCase();
+  const ext = LOGO_TYPES[type];
+  if (!ext) return c.json({ error: "Photo must be PNG, JPG or WebP" }, 400);
+  if (file.size > 3_000_000) return c.json({ error: "Photo must be under 3 MB" }, 400);
+
+  const key = `avatars/${user.sub}-${Date.now()}.${ext}`;
+  await c.env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: type } });
+  const avatarUrl = `${c.env.APP_URL}/media/${key}`;
+  await c.env.DB.prepare("UPDATE users SET avatar_url = ? WHERE id = ?")
+    .bind(avatarUrl, user.sub).run();
+
+  return c.json({ ok: true, avatarUrl });
 });
 
 app.post("/api/campaigns/:id/logo", async (c) => {
@@ -1785,76 +2629,196 @@ app.get("/share/:id", async (c) => {
     ? "<div class=\"amt\">" + formatKwacha(pub.raisedCents) + " raised of " + formatKwacha(pub.goalCents) + "</div>"
     : "<div class=\"amt\">" + formatKwacha(pub.raisedCents) + " raised</div>";
   const endsLine = pub.endsAt ? "ends " + new Date(pub.endsAt).toLocaleDateString() : "";
-  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta property=\"og:title\" content=\"" + pub.title + "\"><meta property=\"og:description\" content=\"" + pub.blurb + "\"><meta name=\"theme-color\" content=\"#1d4ed8\"><title>" + pub.title + " - Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:16px}.card{max-width:420px;width:100%;background:#1e293b;border-radius:16px;padding:24px;text-align:center}h1{font-size:22px;margin:0 0 8px}p{color:#94a3b8;line-height:1.5;margin:0 0 20px}.amt{font-size:28px;font-weight:700;color:#34d399;margin-bottom:20px}a.btn{display:block;background:#25D366;color:#06281b;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:8px 0}a.btn2{display:block;background:#1d4ed8;color:#fff;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:8px 0}.foot{color:#64748b;font-size:12px;margin-top:16px}</style></head><body><div class=\"card\"><h1>" + pub.title + "</h1><p>" + pub.blurb + "</p>" + goalLine + "<a class=\"btn\" href=\"" + wa + "\" target=\"_blank\">Share on WhatsApp</a><a class=\"btn2\" href=\"" + pageUrl + "\">Open Kingdom Sponsor</a><div class=\"foot\">" + (pub.donorCount ?? 0) + " givers - " + endsLine + "</div></div></body></html>";
+  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta property=\"og:title\" content=\"" + pub.title + "\"><meta property=\"og:description\" content=\"" + pub.blurb + "\"><meta name=\"theme-color\" content=\"#1d4ed8\"><title>" + pub.title + " - Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:16px}.card{max-width:420px;width:100%;background:#1e293b;border-radius:16px;padding:24px;text-align:center}h1{font-size:22px;margin:0 0 8px}p{color:#94a3b8;line-height:1.5;margin:0 0 20px}.amt{font-size:28px;font-weight:700;color:#34d399;margin-bottom:20px}a.btn{display:block;background:#25D366;color:#06281b;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:8px 0}a.btn2{display:block;background:#1d4ed8;color:#fff;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:8px 0}a.btn3{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:8px 0}.foot{color:#64748b;font-size:12px;margin-top:16px}</style></head><body><div class=\"card\"><h1>" + pub.title + "</h1><p>" + pub.blurb + "</p>" + goalLine + "<a class=\"btn\" href=\"" + wa + "\" target=\"_blank\">Share on WhatsApp</a><a class=\"btn2\" href=\"kingdomsponsor://campaign/" + id + "\">Open in app</a><a class=\"btn3\" href=\"https://play.google.com/store/apps/details?id=com.kingdomsponsor.app\" target=\"_blank\">Don't have the app? Get it on Play Store</a><div class=\"foot\">" + (pub.donorCount ?? 0) + " givers - " + endsLine + "</div></div></body></html>";
   return c.html(html);
 });
 
 app.post("/api/ussd", async (c) => {
-  const body = await c.req.parseBody().catch(() => ({}));
-  const sessionId = String(body.sessionId ?? c.req.query("sessionId") ?? "");
-  const phone = String(body.phoneNumber ?? c.req.query("phoneNumber") ?? "");
-  const text = String(body.text ?? c.req.query("text") ?? "");
-  const serviceCode = String(body.serviceCode ?? c.req.query("serviceCode") ?? "");
+  const parsed = await c.req.parseBody().catch((): Record<string, string | File> => ({}));
+  const sessionId = String(parsed.sessionId ?? c.req.query("sessionId") ?? "");
+  const phone = String(parsed.phoneNumber ?? c.req.query("phoneNumber") ?? "");
+  const text = String(parsed.text ?? c.req.query("text") ?? "");
+  const serviceCode = String(parsed.serviceCode ?? c.req.query("serviceCode") ?? "");
 
   const parts = text.split("*");
   const level = parts.length;
   const choice = parts[parts.length - 1];
 
-  if (level === 1 && choice === "") {
-    const campaigns = await c.env.DB.prepare(
+  async function topCampaigns() {
+    return (await c.env.DB.prepare(
       "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 10"
-    ).all<{ id: number; title: string }>();
-    const menu = campaigns.results.map((camp, i) => `${i + 1}. ${camp.title}`).join("\n");
-    const response = `CON ${menu}\n0. Exit`;
-    return c.text(response);
+    ).all<{ id: number; title: string }>()).results;
+  }
+
+  async function pendingUssdContribution() {
+    return c.env.DB.prepare(
+      "SELECT * FROM contributions WHERE lipila_reference = ?"
+    ).bind(`USSD-${sessionId}`).first<Record<string, any>>();
+  }
+
+  async function startCollection(row: Record<string, any>, campaign: Record<string, any>) {
+    try {
+      const result = await createCollection(c.env, {
+        referenceId: row.lipila_reference,
+        amountCents: row.amount_cents,
+        accountNumber: phone.replace("+", ""),
+        narration: `Kingdom Sponsor donation to ${campaign.title}`,
+        callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
+      });
+      await c.env.DB.prepare("UPDATE contributions SET lipila_identifier = ? WHERE id = ?")
+        .bind(result.identifier, row.id).run();
+      return true;
+    } catch (e) {
+      console.error("USSD collection failed:", e);
+      await c.env.DB.prepare("UPDATE contributions SET status = 'failed' WHERE id = ?").bind(row.id).run();
+      return false;
+    }
+  }
+
+  if (level === 1 && choice === "") {
+    return c.text("CON Kingdom Sponsor\n1. View campaigns\n2. Scan QR code\n3. Share event\n4. Download app\n0. Exit");
   }
 
   if (level === 1 && choice === "0") {
     return c.text("END Thank you for using Kingdom Sponsor. Goodbye!");
   }
 
+  if (level === 1 && choice === "2") {
+    return c.text("END Open your phone camera or WhatsApp and scan the QR code on the Kingdom Sponsor poster or flyer to access the fundraiser.");
+  }
+
+  if (level === 1 && choice === "3") {
+    return c.text("END Share the Kingdom Sponsor app link: https://kingdom-sponsor.app. Copy the link and send it to your family and friends via WhatsApp.");
+  }
+
+  if (level === 1 && choice === "4") {
+    return c.text("END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit https://kingdom-sponsor.app to get the download link.");
+  }
+
+  const mainMenuText = "CON Kingdom Sponsor\n1. View campaigns\n2. Scan QR code\n3. Share event\n4. Download app\n0. Exit";
+
+  async function campaignListText() {
+    const campaigns = await topCampaigns();
+    const menu = campaigns.map((camp, i) => `${i + 1}. ${camp.title}`).join("\n");
+    return `CON Select a campaign\n${menu}\n0. Back`;
+  }
+
+  const scanText = "END Open your phone camera or WhatsApp and scan the QR code on the Kingdom Sponsor poster or flyer to access the fundraiser.";
+  const shareText = "END Share the Kingdom Sponsor app link: https://kingdom-sponsor.app. Copy the link and send it to your family and friends via WhatsApp.";
+  const downloadText = "END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit https://kingdom-sponsor.app to get the download link.";
+
+  async function makeContribution(campaignId: number, amountCents: number): Promise<boolean> {
+    const referenceId = `USSD-${sessionId}`;
+    await c.env.DB.prepare(
+      "DELETE FROM contributions WHERE lipila_reference = ?"
+    ).bind(referenceId).run();
+    await c.env.DB.prepare(
+      "INSERT INTO contributions (campaign_id, donor_user_id, giver_user_id, is_anonymous, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status) VALUES (?, NULL, NULL, 1, ?, ?, 0, 0, ?, 'pending')"
+    ).bind(campaignId, phone, amountCents, referenceId).run();
+    return true;
+  }
+
   if (level === 1) {
-    const idx = parseInt(choice, 10) - 1;
-    const campaigns = await c.env.DB.prepare(
-      "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 10"
-    ).all<{ id: number; title: string }>();
-    const camp = campaigns.results[idx];
-    if (!camp) return c.text("END Invalid selection.");
-    const response = `CON ${camp.title}\n1. Donate K10\n2. Donate K50\n3. Donate K100\n4. Custom amount\n0. Back`;
-    return c.text(response);
+    return c.text(await campaignListText());
   }
 
   if (level === 2 && choice === "0") {
-    return c.text("CON Main menu\n1. View campaigns\n0. Exit");
+    return c.text(mainMenuText);
   }
 
   if (level === 2) {
-    const amountMap: Record<string, number> = { "1": 1000, "2": 5000, "3": 10000 };
-    let amountCents: number;
+    const campaigns = await topCampaigns();
+    const camp = campaigns[parseInt(choice, 10) - 1];
+    if (!camp) return c.text("END Invalid selection.");
+    return c.text(`CON ${camp.title}\n1. Donate K10\n2. Donate K50\n3. Donate K100\n4. Custom amount\n0. Back`);
+  }
+
+  if (level === 3 && parts[1] === "0") {
+    if (choice === "2") return c.text(scanText);
+    if (choice === "3") return c.text(shareText);
+    if (choice === "4") return c.text(downloadText);
+    if (choice === "0") return c.text("END Thank you for using Kingdom Sponsor. Goodbye!");
+    return c.text(await campaignListText());
+  }
+
+  if (level === 3) {
+    const campaigns = await topCampaigns();
+    const camp = campaigns[parseInt(parts[0], 10) - 1];
+    if (!camp) return c.text("END Invalid selection.");
+
+    if (choice === "0") {
+      return c.text(await campaignListText());
+    }
     if (choice === "4") {
       return c.text("CON Enter amount in kwacha (e.g. 50)");
     }
-    amountCents = (amountMap[choice] ?? 0) * 100;
-    if (amountCents === 0) return c.text("END Invalid amount.");
+    const amountMap: Record<string, number> = { "1": 1000, "2": 5000, "3": 10000 };
+    const amountCents = amountMap[choice];
+    if (!amountCents) return c.text("END Invalid amount.");
 
-    const campaigns = await c.env.DB.prepare(
-      "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 10"
-    ).all<{ id: number; title: string }>();
-    const idx = parseInt(parts[1], 10) - 1;
-    const camp = campaigns.results[idx];
-    if (!camp) return c.text("END Invalid selection.");
-
-    const referenceId = `USSD-${camp.id}-${Date.now()}`;
-    await c.env.DB.prepare(
-      "INSERT INTO contributions (campaign_id, donor_user_id, giver_user_id, is_anonymous, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status) VALUES (?, NULL, NULL, 1, ?, ?, 0, 0, ?, 'pending')"
-    ).bind(camp.id, phone, amountCents, referenceId).run();
-
-    const response = `CON You are about to donate K${(amountCents / 100).toLocaleString()} to "${camp.title}".\nConfirm? 1. Yes 2. No`;
-    return c.text(response);
+    await makeContribution(camp.id, amountCents);
+    return c.text(`CON You are about to donate K${(amountCents / 100).toLocaleString()} to "${camp.title}".\nConfirm? 1. Yes 2. No`);
   }
 
-  if (level === 3 && choice === "1") {
-    return c.text("CON Donation confirmed. Thank you for your support!");
+  if (level === 4 && parts[1] === "0") {
+    const campaigns = await topCampaigns();
+    const camp = campaigns[parseInt(choice, 10) - 1];
+    if (!camp) return c.text("END Invalid selection.");
+    return c.text(`CON ${camp.title}\n1. Donate K10\n2. Donate K50\n3. Donate K100\n4. Custom amount\n0. Back`);
+  }
+
+  if (level === 4) {
+    const campaigns = await topCampaigns();
+    const camp = campaigns[parseInt(parts[0], 10) - 1];
+    if (!camp) return c.text("END Invalid selection.");
+
+    if (parts[2] === "0") {
+      const camp2 = campaigns[parseInt(choice, 10) - 1];
+      if (!camp2) return c.text("END Invalid selection.");
+      return c.text(`CON ${camp2.title}\n1. Donate K10\n2. Donate K50\n3. Donate K100\n4. Custom amount\n0. Back`);
+    }
+
+    const row = await pendingUssdContribution();
+    if (!row) return c.text("END Session expired. Please start again.");
+
+    if (parts[2] === "4") {
+      const kwacha = parseInt(choice.replace(/\D/g, ""), 10);
+      const amountCents = (isFinite(kwacha) ? kwacha : 0) * 100;
+      if (amountCents < 100) return c.text("END Minimum donation is K1.00.");
+      await makeContribution(camp.id, amountCents);
+      return c.text(`CON You are about to donate K${(amountCents / 100).toLocaleString()} to "${camp.title}".\nConfirm? 1. Yes 2. No`);
+    }
+
+    if (choice === "2") {
+      await c.env.DB.prepare("UPDATE contributions SET status = 'failed' WHERE id = ?").bind(row.id).run();
+      return c.text("END Donation cancelled. Thank you.");
+    }
+    if (choice === "1") {
+      const ok = await startCollection(row, camp);
+      return ok
+        ? c.text("END Check your phone and enter your PIN to complete the donation. Thank you for your support!")
+        : c.text("END Payment could not be started. Please try again later.");
+    }
+  }
+
+  if (level === 5) {
+    const row = await pendingUssdContribution();
+    if (!row) return c.text("END Session expired. Please start again.");
+
+    const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
+      .bind(row.campaign_id).first<Record<string, any>>();
+    if (!campaign) return c.text("END Campaign not found.");
+
+    if (choice === "2") {
+      await c.env.DB.prepare("UPDATE contributions SET status = 'failed' WHERE id = ?").bind(row.id).run();
+      return c.text("END Donation cancelled. Thank you.");
+    }
+    if (choice === "1") {
+      const ok = await startCollection(row, campaign);
+      return ok
+        ? c.text("END Check your phone and enter your PIN to complete the donation. Thank you for your support!")
+        : c.text("END Payment could not be started. Please try again later.");
+    }
   }
 
   return c.text("END Thank you for using Kingdom Sponsor. Goodbye!");
@@ -1866,11 +2830,22 @@ app.get("/privacy", (c) => {
 });
 
 app.get("/delete-account", (c) => {
-  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete Account — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:600px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Delete Account Request</h1><h2>Kingdom Sponsor</h2><p>To request deletion of your account and associated data:</p><ol><li>Email <strong>support@kingdom-sponsor.app</strong> with the subject \"Delete Account\"</li><li>Include the phone number associated with your account</li><li>Your request will be processed within 30 days</li></ol><h2>Data Deleted</h2><ul><li>Username and profile information</li><li>Donation history and contributions</li><li>Pledge records</li><li>User links</li><li>FCM device tokens</li></ul><h2>Data Retained</h2><ul><li>Transaction records (required for financial compliance) — retained for 7 years</li><li>Anonymized analytics — retained indefinitely</li><li>Audit logs — retained for 1 year</li></ul><p>If you simply want to stop receiving SMS notifications, you can reply STOP to any SMS from us.</p></body></html>";
+  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete Account — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:600px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Delete Account</h1><h2>Kingdom Sponsor</h2><p><strong>In the app:</strong> open the app, tap the settings icon, then \"Delete account\". Your account and personal data are deleted immediately.</p><p><strong>By email:</strong> email <strong>support@kingdom-sponsor.app</strong> with the subject \"Delete Account\" and the phone number associated with your account. Requests are processed within 30 days.</p><h2>Data Deleted</h2><ul><li>Username and profile information</li><li>Pledge records</li><li>User links</li><li>FCM device tokens</li><li>Donor name and identity on contributions</li></ul><h2>Data Retained</h2><ul><li>Transaction records (required for financial compliance) — retained for 7 years</li><li>Anonymized analytics — retained indefinitely</li><li>Audit logs — retained for 1 year</li></ul><p>If you simply want to stop receiving SMS notifications, you can reply STOP to any SMS from us.</p></body></html>";
   return c.html(html);
 });
 
-app.get("/", (c) => c.json({ name: "Kingdom Sponsor API", version: "0.2.0" }));
+app.get("/", (c) => c.json({ name: "Kingdom Sponsor API", version: "0.3.0" }));
+
+/** Scheduled: sweep payout-eligible balances for every active campaign. */
+async function runAutoDisburse(env: Bindings): Promise<void> {
+  const rows = await env.DB.prepare(
+    "SELECT id FROM campaigns WHERE status = 'active'"
+  ).all<{ id: number }>();
+  for (const row of rows.results) {
+    await createWithdrawal(env, row.id);
+  }
+  console.log(`auto-disburse: checked ${rows.results.length} active campaigns`);
+}
 
 const appObject = {
   fetch: app.fetch,
@@ -1878,6 +2853,8 @@ const appObject = {
     ctx.waitUntil(runFeeSweep(env));
     ctx.waitUntil(runPledgeReminders(env));
     ctx.waitUntil(runPromotionExpiry(env));
+    ctx.waitUntil(runAutoDisburse(env));
+    ctx.waitUntil(runWithdrawalStatusChecks(env));
   },
 };
 

@@ -54,8 +54,20 @@ export async function ensureUser(db: D1Database, phone: string): Promise<{ id: n
   return { id: user.id, username: user.username, phone: user.phone };
 }
 
-/** Total visible giving of a donor across all campaigns. */
+/** Total giving of a donor across all campaigns (incl. hidden amounts).
+ *  Used for the donor's own badge/tier tally - hiding an amount from the
+ *  public must never reduce their own giving total. */
 export async function donorTotalCents(db: D1Database, donorUserId: number | null): Promise<number> {
+  if (!donorUserId) return 0;
+  const row = (await db.prepare(
+    "SELECT COALESCE(SUM(amount_cents),0) AS s FROM contributions WHERE donor_user_id = ? AND status = 'confirmed'"
+  ).bind(donorUserId).first<{ s: number }>()) ?? { s: 0 };
+  return row.s;
+}
+
+/** Total of a donor's PUBLIC (non-hidden) giving - used where the amount is
+ *  shown to other users, so the displayed tier matches the displayed total. */
+export async function donorVisibleCents(db: D1Database, donorUserId: number | null): Promise<number> {
   if (!donorUserId) return 0;
   const row = (await db.prepare(
     "SELECT COALESCE(SUM(amount_cents),0) AS s FROM contributions WHERE donor_user_id = ? AND status = 'confirmed' AND hide_amount = 0"

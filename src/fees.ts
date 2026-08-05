@@ -1,10 +1,13 @@
-// Fee model: the platform takes a small cut; Lipila also charges per transaction.
-// All values in ngwee (cents). Configure percentages via [vars] in wrangler.toml.
+// Fee model: both Kingdom Sponsor and Lipila take a small cut on collection AND
+// on disbursement. All values in ngwee (cents). Configure percentages via [vars]
+// in wrangler.toml.
 //
 // Collection: customer pays platform + Lipila collection together on MoMo
 // (default 1% + 2.5% = 3.5% total). Platform fee is a flat K3 minimum, or 1%
-// of the donation when that is higher. Disbursement: Lipila's payout fee is
-// deducted from the host's payout at payout time.
+// of the donation when that is higher. Disbursement: Lipila's payout fee (1.5%)
+// and Kingdom Sponsor's payout cut (K3 min / 1%) are both deducted from the
+// host's payout at payout time.
+
 
 export interface FeeConfig {
   platformPct: number;         // e.g. 1  -> 1% above the minimum
@@ -43,11 +46,16 @@ export function pctOf(cents: number, pct: number): number {
   return Math.round((cents * pct) / 100);
 }
 
-/** Donation -> fees taken from that donation. Platform fee is K3 min, else pct. */
+/** Donation -> fees taken from that donation. Platform fee is K3 min, else pct, capped at amount. */
 export function donationFees(amountCents: number, cfg: FeeConfig) {
+  const lipilaFeeCents = pctOf(amountCents, cfg.lipilaCollectionPct);
+  const platformFeeCents = Math.min(
+    Math.max(cfg.platformMinFeeCents, pctOf(amountCents, cfg.platformPct)),
+    Math.max(0, amountCents - lipilaFeeCents)
+  );
   return {
-    platformFeeCents: Math.max(cfg.platformMinFeeCents, pctOf(amountCents, cfg.platformPct)),
-    lipilaFeeCents: pctOf(amountCents, cfg.lipilaCollectionPct),
+    platformFeeCents,
+    lipilaFeeCents,
   };
 }
 
