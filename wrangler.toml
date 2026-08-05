@@ -40,6 +40,14 @@ AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (not user-facing
 AT_FROM = ""             # registered AT sender ID / shortcode for production SMS (empty = AT default)
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
 APP_URL = "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev"
+# When you buy a custom domain (e.g. kingdom-sponsor.app):
+#   1. Add the domain in Cloudflare DNS (A record → Workers)
+#   2. In the Cloudflare dashboard → Workers → your worker → Settings → Routes
+#      add a route like `kingdom-sponsor.app/*` → kingdom-sponsor-api
+#   3. Set workers_dev = false (removes the *.workers.dev route)
+#   4. Change APP_URL below to your custom domain
+#   5. Run `npx wrangler deploy`
+#   6. All share links, deep links, and webhook callbacks will use the new domain automatically.
 PLATFORM_FEE_PCT = "1"          # your cut per donation (%), Kingdom Sponsor keeps 1% above the minimum
 PLATFORM_MIN_FEE_CENTS = "300"  # flat minimum platform fee per donation (K3)
 LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila MoMo collection fee (%) -> customer pays 3.5% total on MoMo

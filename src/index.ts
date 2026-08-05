@@ -683,7 +683,7 @@ async function runPledgeReminders(env: Bindings): Promise<void> {
   ).bind(today, daysInMonth).all<Record<string, any>>();
 
   for (const row of rows.results) {
-    const message = pledgeReminderSms(row.campaign_title, row.amount_cents, row.campaign_id);
+    const message = pledgeReminderSms(row.campaign_title, row.amount_cents, row.campaign_id, env.APP_URL);
     await smsIfNoPush(env, row.user_id, row.phone, message);
 
     // Push notification

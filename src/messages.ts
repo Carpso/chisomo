@@ -8,8 +8,9 @@ export function kwacha(cents: number): string {
   return frac === "00" ? `K${grouped}` : `K${grouped}.${frac}`;
 }
 
-export function campaignLink(campaignId: number | string): string {
-  return `https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev/share/${campaignId}`;
+export function campaignLink(campaignId: number | string, baseUrl?: string): string {
+  const url = baseUrl ?? "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev";
+  return `${url}/share/${campaignId}`;
 }
 
 /** Sent to the donor right after a donation is confirmed. */
@@ -33,8 +34,8 @@ export function payoutFailedSms(campaignTitle: string, amountCents: number): str
 }
 
 /** Monthly reminder for a recurring pledge. */
-export function pledgeReminderSms(campaignTitle: string, amountCents: number, campaignId?: number): string {
-  const link = campaignId ? `Give here: ${campaignLink(campaignId)}` : "";
+export function pledgeReminderSms(campaignTitle: string, amountCents: number, campaignId?: number, baseUrl?: string): string {
+  const link = campaignId ? `Give here: ${campaignLink(campaignId, baseUrl)}` : "";
   return `Friendly reminder: your monthly pledge of ${kwacha(amountCents)} to "${campaignTitle}" is due today. ${link} Kingdom Sponsor`;
 }
 
