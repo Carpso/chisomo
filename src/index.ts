@@ -2268,26 +2268,33 @@ app.post("/api/webhooks/lipila", async (c) => {
   return c.json({ ok: true });
 });
 
-// Africa's Talking SMS delivery reports. Register this URL in the AT dashboard:
-// SMS -> SMS Callback URLs. AT POSTs form-encoded delivery status per message.
+// Africa's Talking SMS callbacks. One endpoint for every SMS callback field in
+// the AT dashboard (SMS -> SMS Callback URLs): delivery reports, incoming
+// messages, bulk SMS opt-outs, subscription notifications. AT POSTs
+// form-encoded or JSON payloads; we only log and always answer 200 so AT never
+// retries. (We don't act on inbound messages/opt-outs yet.)
 app.post("/api/webhooks/at-sms", async (c) => {
   const body = await c.req.text().catch(() => "");
   const form = new URLSearchParams(body);
-  const rec = {
+  let rec: Record<string, string | null> = {
     id: form.get("id"),
     status: form.get("status"),
-    phoneNumber: form.get("phoneNumber"),
+    phoneNumber: form.get("phoneNumber") ?? form.get("from"),
     cost: form.get("cost"),
   };
   if (!rec.id && !rec.status) {
-    let json: any = null;
     try {
-      json = JSON.parse(body);
+      const json = JSON.parse(body);
+      if (json && typeof json === "object") {
+        rec = {
+          id: json.id ?? null,
+          status: json.status ?? null,
+          phoneNumber: json.phoneNumber ?? json.from ?? null,
+          cost: json.cost ?? null,
+        };
+      }
     } catch {
-      json = null;
-    }
-    if (!json || (!json.id && !json.status)) {
-      return c.json({ error: "Unrecognized payload" }, 400);
+      // not JSON; keep the empty form parse above
     }
   }
   if (rec.status && rec.status !== "Success") {
