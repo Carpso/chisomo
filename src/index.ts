@@ -1099,6 +1099,7 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
 
   const cfg = loadFeeConfig(c.env);
   const fees = donationFees(amountCents, cfg);
+  const totalCents = amountCents + fees.platformFeeCents + fees.lipilaFeeCents;
   const referenceId = `CON-${campaign.id}-${Date.now()}`;
 
   const r = await c.env.DB.prepare(
@@ -1120,7 +1121,7 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
   try {
     const result = await createCollection(c.env, {
       referenceId,
-      amountCents,
+      amountCents: totalCents,
       accountNumber: phone.replace("+", ""),
       narration: `Kingdom Sponsor donation to ${campaign.title}`,
       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
@@ -1132,6 +1133,8 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
       referenceId,
       message: "Check your phone and enter your PIN to complete the donation.",
       platformFeeCents: fees.platformFeeCents,
+      lipilaFeeCents: fees.lipilaFeeCents,
+      totalCents,
     });
   } catch (e) {
     await c.env.DB.prepare(
@@ -1366,6 +1369,7 @@ app.post("/api/campaigns/:id/gift", async (c) => {
   const phone = user.phone; // giver's phone for payment prompt
   const cfg = loadFeeConfig(c.env);
   const fees = donationFees(amountCents, cfg);
+  const totalCents = amountCents + fees.platformFeeCents + fees.lipilaFeeCents;
   const referenceId = `CON-GIFT-${campaign.id}-${Date.now()}`;
 
   const r = await c.env.DB.prepare(
@@ -1388,7 +1392,7 @@ app.post("/api/campaigns/:id/gift", async (c) => {
   try {
     const result = await createCollection(c.env, {
       referenceId,
-      amountCents,
+      amountCents: totalCents,
       accountNumber: phone.replace("+", ""),
       narration: `Kingdom Sponsor gift to ${campaign.title}`,
       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
@@ -1399,6 +1403,8 @@ app.post("/api/campaigns/:id/gift", async (c) => {
       referenceId,
       message: "Check your phone and enter PIN to complete the gift.",
       platformFeeCents: fees.platformFeeCents,
+      lipilaFeeCents: fees.lipilaFeeCents,
+      totalCents,
     });
   } catch (e) {
     await c.env.DB.prepare("UPDATE contributions SET status = 'failed' WHERE id = ?")
@@ -3155,7 +3161,7 @@ app.post("/api/ussd", async (c) => {
     try {
       const result = await createCollection(c.env, {
         referenceId: row.lipila_reference,
-        amountCents: row.amount_cents,
+        amountCents: row.amount_cents + row.platform_fee_cents + row.lipila_fee_cents,
         accountNumber: phone.replace("+", ""),
         narration: `Kingdom Sponsor donation to ${campaign.title}`,
         callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
@@ -3203,13 +3209,14 @@ app.post("/api/ussd", async (c) => {
   const downloadText = "END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit https://kingdom-sponsor.app to get the download link.";
 
   async function makeContribution(campaignId: number, amountCents: number): Promise<boolean> {
+    const fees = donationFees(amountCents, loadFeeConfig(c.env));
     const referenceId = `USSD-${sessionId}`;
     await c.env.DB.prepare(
       "DELETE FROM contributions WHERE lipila_reference = ?"
     ).bind(referenceId).run();
     await c.env.DB.prepare(
-      "INSERT INTO contributions (campaign_id, donor_user_id, giver_user_id, is_anonymous, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status) VALUES (?, NULL, NULL, 1, ?, ?, 0, 0, ?, 'pending')"
-    ).bind(campaignId, phone, amountCents, referenceId).run();
+      "INSERT INTO contributions (campaign_id, donor_user_id, giver_user_id, is_anonymous, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status) VALUES (?, NULL, NULL, 1, ?, ?, ?, ?, ?, 'pending')"
+    ).bind(campaignId, phone, amountCents, fees.platformFeeCents, fees.lipilaFeeCents, referenceId).run();
     return true;
   }
 
@@ -3252,7 +3259,9 @@ app.post("/api/ussd", async (c) => {
     if (!amountCents) return c.text("END Invalid amount.");
 
     await makeContribution(camp.id, amountCents);
-    return c.text(`CON You are about to donate K${(amountCents / 100).toLocaleString()} to "${camp.title}".\nConfirm? 1. Yes 2. No`);
+    const ussdRow = await pendingUssdContribution();
+    const ussdTotal = ussdRow ? ussdRow.amount_cents + ussdRow.platform_fee_cents + ussdRow.lipila_fee_cents : amountCents;
+    return c.text(`CON You are about to donate K${(amountCents / 100).toLocaleString()} (K${(ussdTotal / 100).toLocaleString()} total incl. fees) to "${camp.title}".\nConfirm? 1. Yes 2. No`);
   }
 
   if (level === 4 && parts[1] === "0") {
@@ -3281,7 +3290,9 @@ app.post("/api/ussd", async (c) => {
       const amountCents = (isFinite(kwacha) ? kwacha : 0) * 100;
       if (amountCents < 100) return c.text("END Minimum donation is K1.00.");
       await makeContribution(camp.id, amountCents);
-      return c.text(`CON You are about to donate K${(amountCents / 100).toLocaleString()} to "${camp.title}".\nConfirm? 1. Yes 2. No`);
+      const ussdRow = await pendingUssdContribution();
+      const ussdTotal = ussdRow ? ussdRow.amount_cents + ussdRow.platform_fee_cents + ussdRow.lipila_fee_cents : amountCents;
+      return c.text(`CON You are about to donate K${(amountCents / 100).toLocaleString()} (K${(ussdTotal / 100).toLocaleString()} total incl. fees) to "${camp.title}".\nConfirm? 1. Yes 2. No`);
     }
 
     if (choice === "2") {
