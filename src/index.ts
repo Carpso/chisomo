@@ -1148,18 +1148,19 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
 app.get("/api/contributions/status/:referenceId", async (c) => {
   const referenceId = c.req.param("referenceId");
   const row = await c.env.DB.prepare(
-    "SELECT * FROM contributions WHERE lipila_reference = ?"
-  ).bind(referenceId).first<Record<string, any>>();
+    "SELECT * FROM contributions WHERE lipila_reference = ? OR lipila_identifier = ?"
+  ).bind(referenceId, referenceId).first<Record<string, any>>();
   if (!row) return c.json({ error: "Not found" }, 404);
   if (row.status === "pending") {
     try {
-      const st = await checkCollectionStatus(c.env, referenceId);
+      const effectiveRef = row.lipila_reference;
+      const st = await checkCollectionStatus(c.env, effectiveRef);
       const s = String(st.status).toLowerCase();
       if (s.includes("success")) {
-        await confirmContribution(c.env, referenceId);
+        await confirmContribution(c.env, effectiveRef);
         row.status = "confirmed";
       } else if (s.includes("fail") || s.includes("cancelled") || s.includes("canceled")) {
-        await failContribution(c.env, referenceId);
+        await failContribution(c.env, effectiveRef);
         row.status = "failed";
       }
     } catch (e) {
@@ -1167,11 +1168,69 @@ app.get("/api/contributions/status/:referenceId", async (c) => {
     }
   }
   return c.json({
-    referenceId,
+    referenceId: row.lipila_reference,
     id: row.id,
     status: row.status,
     amountCents: row.amount_cents,
   });
+});
+
+/** Resend a Lipila collection prompt for a pending contribution.
+ *  Generates a fresh referenceId so Lipila creates a new prompt,
+ *  and updates the row so the app's poll still finds it.
+ */
+app.post("/api/contributions/:referenceId/resend-prompt", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const oldRef = c.req.param("referenceId");
+  const row = await c.env.DB.prepare(
+    "SELECT * FROM contributions WHERE lipila_reference = ?"
+  ).bind(oldRef).first<Record<string, any>>();
+  if (!row) return c.json({ error: "Not found" }, 404);
+  if (row.status !== "pending") {
+    return c.json({ error: "This payment is no longer waiting for your PIN." }, 400);
+  }
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT * FROM campaigns WHERE id = ?"
+  ).bind(row.campaign_id).first<Record<string, any>>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+
+  const cfg = loadFeeConfig(c.env);
+  const fees = donationFees(row.amount_cents, cfg);
+  const newRef = `${oldRef}-R${Date.now()}`;
+  const totalCents = row.amount_cents + fees.platformFeeCents + fees.lipilaFeeCents;
+
+  await c.env.DB.prepare(
+    "UPDATE contributions SET lipila_reference = ?, lipila_identifier = NULL, platform_fee_cents = ?, lipila_fee_cents = ? WHERE id = ?"
+  ).bind(newRef, fees.platformFeeCents, fees.lipilaFeeCents, row.id).run();
+
+  try {
+    const result = await createCollection(c.env, {
+      referenceId: newRef,
+      amountCents: totalCents,
+      accountNumber: row.phone.replace("+", ""),
+      narration: `Kingdom Sponsor donation to ${campaign.title}`,
+      callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
+    });
+    await c.env.DB.prepare(
+      "UPDATE contributions SET lipila_identifier = ? WHERE id = ?"
+    ).bind(result.identifier, row.id).run();
+    return c.json({
+      referenceId: newRef,
+      message: "A new payment prompt has been sent to your phone.",
+      platformFeeCents: fees.platformFeeCents,
+      lipilaFeeCents: fees.lipilaFeeCents,
+      totalCents,
+    });
+  } catch (e) {
+    await c.env.DB.prepare(
+      "UPDATE contributions SET lipila_reference = ?, lipila_identifier = NULL WHERE id = ?"
+    ).bind(oldRef, row.id).run();
+    console.error("resend collection failed:", e);
+    return c.json({ error: "Could not resend the prompt. Try again." }, 502);
+  }
 });
 
 // ---------- device tokens (FCM) ----------

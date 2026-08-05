@@ -46,12 +46,12 @@ export function pctOf(cents: number, pct: number): number {
   return Math.round((cents * pct) / 100);
 }
 
-/** Donation -> fees taken from that donation. Platform fee is K3 min, else pct, capped at amount. */
+/** Donation -> fees taken from that donation. Platform fee is K3 min, else pct. Always the real K3/1%. */
 export function donationFees(amountCents: number, cfg: FeeConfig) {
   const lipilaFeeCents = pctOf(amountCents, cfg.lipilaCollectionPct);
-  const platformFeeCents = Math.min(
-    Math.max(cfg.platformMinFeeCents, pctOf(amountCents, cfg.platformPct)),
-    Math.max(0, amountCents - lipilaFeeCents)
+  const platformFeeCents = Math.max(
+    cfg.platformMinFeeCents,
+    pctOf(amountCents, cfg.platformPct)
   );
   return {
     platformFeeCents,
