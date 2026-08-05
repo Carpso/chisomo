@@ -35,7 +35,7 @@ export interface TokenPayload {
   exp: number;
 }
 
-export async function signToken(payload: Omit<TokenPayload, "iat" | "exp">, secret: string, ttlSeconds = 60 * 60 * 24 * 30): Promise<string> {
+export async function signToken(payload: Omit<TokenPayload, "iat" | "exp">, secret: string, ttlSeconds = 60 * 60 * 24 * 90): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const header = b64url(enc.encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
   const body = b64url(enc.encode(JSON.stringify({ ...payload, iat: now, exp: now + ttlSeconds })));
