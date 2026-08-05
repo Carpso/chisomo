@@ -2271,8 +2271,9 @@ app.post("/api/webhooks/lipila", async (c) => {
 // Africa's Talking SMS callbacks. One endpoint for every SMS callback field in
 // the AT dashboard (SMS -> SMS Callback URLs): delivery reports, incoming
 // messages, bulk SMS opt-outs, subscription notifications. AT POSTs
-// form-encoded or JSON payloads; we only log and always answer 200 so AT never
-// retries. (We don't act on inbound messages/opt-outs yet.)
+// form-encoded or JSON payloads. Every payload is stored in the sms_events
+// table (per AT's recommendation to keep a copy) and we always answer 200 so
+// AT never retries. (We don't act on inbound messages/opt-outs yet.)
 app.post("/api/webhooks/at-sms", async (c) => {
   const body = await c.req.text().catch(() => "");
   const form = new URLSearchParams(body);
@@ -2280,7 +2281,6 @@ app.post("/api/webhooks/at-sms", async (c) => {
     id: form.get("id"),
     status: form.get("status"),
     phoneNumber: form.get("phoneNumber") ?? form.get("from"),
-    cost: form.get("cost"),
   };
   if (!rec.id && !rec.status) {
     try {
@@ -2290,17 +2290,35 @@ app.post("/api/webhooks/at-sms", async (c) => {
           id: json.id ?? null,
           status: json.status ?? null,
           phoneNumber: json.phoneNumber ?? json.from ?? null,
-          cost: json.cost ?? null,
         };
       }
     } catch {
       // not JSON; keep the empty form parse above
     }
   }
+
+  const lower = body.toLowerCase();
+  const kind = rec.status
+    ? "delivery"
+    : lower.includes("optout") || lower.includes("opt_out") || lower.includes("opt-out")
+      ? "optout"
+      : lower.includes("subscription") || lower.includes("unsubscription")
+        ? "subscription"
+        : (rec.phoneNumber && lower.includes("text")) || lower.includes('"text"') || lower.includes("&text=")
+          ? "inbound"
+          : "other";
+
+  await c.env.DB.prepare(
+    "INSERT INTO sms_events (kind, ref_id, status, phone, payload) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(kind, rec.id, rec.status, rec.phoneNumber, body)
+    .run()
+    .catch((e: any) => console.error("[AT SMS] event insert failed:", e));
+
   if (rec.status && rec.status !== "Success") {
     console.error(`[AT SMS] delivery ${rec.status} for ${rec.id} -> ${rec.phoneNumber}`);
   }
-  console.log("[AT SMS webhook]", JSON.stringify(rec));
+  console.log("[AT SMS webhook]", JSON.stringify({ ...rec, kind }));
   return c.text("OK", 200);
 });
 
