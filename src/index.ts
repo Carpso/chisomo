@@ -2158,7 +2158,7 @@ app.get("/api/admin/delete-requests", async (c) => {
 });
 
 /** Soft-delete a campaign (financial records are kept for compliance; campaign becomes invisible). */
-async function deleteCampaign(env: Bindings, campaignId: number): Promise<void> {
+async function deleteCampaign(env: Bindings, campaignId: number, reason?: string | null): Promise<void> {
   const campaign = await env.DB.prepare(
     "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(campaignId).first<Record<string, any>>();
@@ -2169,12 +2169,41 @@ async function deleteCampaign(env: Bindings, campaignId: number): Promise<void> 
     env.DB.prepare("UPDATE promotions SET status = 'cancelled' WHERE campaign_id = ? AND status IN ('pending','pending_approval','active')").bind(campaignId),
   ]);
 
+  const note = reason ? ` Reason: ${reason}` : "";
+  const hostBody = `"${campaign.title}" has been removed from Kingdom Sponsor.${note}`;
+  const donorTitle = `"${campaign.title}" removed`;
+  const donorBody = `This campaign was removed by the administrator.${note}`;
+
   if (campaign.host_phone) {
-    await sendSms(env, campaign.host_phone, campaignDeletedSms(campaign.title))
+    await sendSms(env, campaign.host_phone, `Kingdom Sponsor: "${campaign.title}" has been removed from the platform.${note}`)
       .catch((e) => console.error("campaign-deleted sms failed:", e));
-    await pushToUser(env, campaign.host_user_id, "Campaign removed",
-      `"${campaign.title}" has been removed from Kingdom Sponsor.`, { type: "campaign_deleted", campaignId: String(campaignId) })
+    await pushToUser(env, campaign.host_user_id, "Campaign removed", hostBody, { type: "campaign_deleted", campaignId: String(campaignId) })
       .catch((e) => console.error("campaign-deleted push failed:", e));
+  }
+
+  // Alert the campaign's donors (push to app users, SMS to those without the app).
+  if (envPushConfigured(env)) {
+    const donorTokens = await env.DB.prepare(
+      `SELECT DISTINCT dt.token FROM device_tokens dt
+       JOIN contributions co ON co.donor_user_id = dt.user_id
+       WHERE co.campaign_id = ? AND co.status = 'confirmed'`
+    ).bind(campaignId).all<{ token: string }>();
+    const tokens = donorTokens.results.map((d) => d.token);
+    if (tokens.length) {
+      await sendMulticastPush(fbEnv(env), tokens, donorTitle, donorBody,
+        { type: "campaign_deleted", campaignId: String(campaignId) })
+        .catch((e) => console.error("campaign-deleted donor push failed:", e));
+    }
+  }
+  const smsPhones = await env.DB.prepare(
+    `SELECT DISTINCT co.phone FROM contributions co
+     WHERE co.campaign_id = ? AND co.status = 'confirmed' AND co.phone IS NOT NULL
+       AND (co.donor_user_id IS NULL OR NOT EXISTS (
+         SELECT 1 FROM device_tokens dt WHERE dt.user_id = co.donor_user_id))`
+  ).bind(campaignId).all<{ phone: string }>();
+  for (const row of smsPhones.results) {
+    await sendSms(env, row.phone, `Kingdom Sponsor: "${campaign.title}" was removed by the administrator.${note}`)
+      .catch((e) => console.error("campaign-deleted donor sms failed:", e));
   }
 }
 
@@ -2187,12 +2216,15 @@ app.post("/api/admin/campaigns/:id/delete", async (c) => {
   if (!campaign) return c.json({ error: "Campaign not found" }, 404);
   if (campaign.status === "deleted") return c.json({ error: "Campaign already deleted." }, 400);
 
-  await deleteCampaign(c.env, campaign.id);
+  const body = await c.req.json().catch(() => ({}));
+  const reason = String(body.reason ?? "").trim().slice(0, 500) || null;
+
+  await deleteCampaign(c.env, campaign.id, reason);
   await c.env.DB.prepare(
     "UPDATE campaign_delete_requests SET status = 'approved', resolved_at = datetime('now', '+2 hours') WHERE campaign_id = ? AND status = 'pending'"
   ).bind(campaign.id).run();
 
-  return c.json({ ok: true });
+  return c.json({ ok: true, message: reason ? `Campaign deleted. Host and donors were alerted with your note.` : "Campaign deleted. Host and donors were alerted." });
 });
 
 app.post("/api/admin/delete-requests/:id/approve", async (c) => {
