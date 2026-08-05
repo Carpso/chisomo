@@ -2268,6 +2268,35 @@ app.post("/api/webhooks/lipila", async (c) => {
   return c.json({ ok: true });
 });
 
+// Africa's Talking SMS delivery reports. Register this URL in the AT dashboard:
+// SMS -> SMS Callback URLs. AT POSTs form-encoded delivery status per message.
+app.post("/api/webhooks/at-sms", async (c) => {
+  const body = await c.req.text().catch(() => "");
+  const form = new URLSearchParams(body);
+  const rec = {
+    id: form.get("id"),
+    status: form.get("status"),
+    phoneNumber: form.get("phoneNumber"),
+    cost: form.get("cost"),
+  };
+  if (!rec.id && !rec.status) {
+    let json: any = null;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      json = null;
+    }
+    if (!json || (!json.id && !json.status)) {
+      return c.json({ error: "Unrecognized payload" }, 400);
+    }
+  }
+  if (rec.status && rec.status !== "Success") {
+    console.error(`[AT SMS] delivery ${rec.status} for ${rec.id} -> ${rec.phoneNumber}`);
+  }
+  console.log("[AT SMS webhook]", JSON.stringify(rec));
+  return c.text("OK", 200);
+});
+
 // ---------- host dashboard ----------
 
 app.get("/api/host/me", async (c) => {
