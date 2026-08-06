@@ -11,6 +11,7 @@ import { sendOtpSms, sendSms } from "./sms";
 import { loadFeeConfig, donationFees, payoutAmountCents, disbursementFeeCents, platformDisbursementFeeCents, feeConfigPublic, formatKwacha } from "./fees";
 import { generateUsername, ensureUser, donorTotalCents, donorVisibleCents, tierFor } from "./donors";
 import { sendPushNotification, sendMulticastPush } from "./firebase";
+import { shortenUrl } from "./shorten";
 import {
   donationConfirmedSms, donationReceivedSms, payoutSentSms, payoutFailedSms, pledgeReminderSms,
   promotionActiveSms, promotionRejectedSms, campaignDeletedSms, deleteRequestReceivedSms,
@@ -37,6 +38,8 @@ type Bindings = LipilaEnv & SmsEnv2 & {
   FIREBASE_CLIENT_EMAIL?: string;
   FIREBASE_PRIVATE_KEY?: string;
   SENTRY_DSN?: string;
+  BITLY_ACCESS_TOKEN?: string;
+  ALERT_FROM_EMAIL?: string;
 };
 
 interface SmsEnv2 {
@@ -83,6 +86,10 @@ function fbEnv(env: Bindings) {
 /** Best-effort push to every device registered to a user (no-op when FCM isn't configured). */
 async function pushToUser(env: Bindings, userId: number | null, title: string, body: string, data?: Record<string, string>): Promise<void> {
   if (!envPushConfigured(env) || !userId) return;
+  const row = await env.DB.prepare(
+    "SELECT notifications_enabled FROM users WHERE id = ?"
+  ).bind(userId).first<{ notifications_enabled: number }>();
+  if (!row || row.notifications_enabled === 0) return;
   const rows = await env.DB.prepare(
     "SELECT token FROM device_tokens WHERE user_id = ?"
   ).bind(userId).all<{ token: string }>();
@@ -147,6 +154,139 @@ async function pushAndSmsAdmins(env: Bindings, smsText: string, pushTitle: strin
   }
 }
 
+// ---------- intruder alerts (Telegram + SMS/push + email) ----------
+
+interface FailedLoginRow {
+  id: number;
+  phone: string;
+  ip?: string;
+  user_agent?: string;
+  reason: string;
+  created_at?: string;
+}
+
+function intruderReasonLabel(reason: string): string {
+  switch (reason) {
+    case "wrong_code": return "wrong code entered";
+    case "otp_expired": return "code expired";
+    case "too_many_attempts": return "too many attempts";
+    default: return reason || "unknown reason";
+  }
+}
+
+/** Plain-text draft of the intruder alert warning message. */
+function buildIntruderAlertText(rows: FailedLoginRow[]): string {
+  const n = rows.length;
+  const when = rows[0]?.created_at ? ` (${rows[0].created_at})` : "";
+  const details = rows
+    .map((r) => {
+      const ua = r.user_agent ? ` · ${r.user_agent.slice(0, 80)}` : "";
+      return `• ${r.created_at ?? "?"} — ${r.phone} — ${intruderReasonLabel(r.reason)} — IP ${r.ip ?? "?"}${ua}`;
+    })
+    .join("\n");
+  return [
+    `🚨 SECURITY ALERT — ${n} failed login attempt${n === 1 ? "" : "s"} on Kingdom Sponsor${when}`,
+    ``,
+    `Someone tried (and failed) to sign in with these numbers. If this was not you, your number may be under attack.`,
+    ``,
+    details,
+    ``,
+    `If this was not you, secure your number and contact support immediately. — Kingdom Sponsor`,
+  ].join("\n");
+}
+
+/** Best-effort email to the configured admin (MailChannels API; requires the
+ *  Domain Lockdown DNS record on the from-domain to actually deliver). */
+async function sendAdminEmail(env: Bindings, subject: string, text: string): Promise<boolean> {
+  const toRow = await env.DB.prepare(
+    "SELECT value FROM admin_settings WHERE key = 'admin_email'"
+  ).first<Record<string, any>>();
+  const to = toRow?.value as string | undefined;
+  if (!to) return false;
+  try {
+    const fromEmail = env.ALERT_FROM_EMAIL ?? to;
+    const res = await fetch("https://send.mailchannels.net/api/v1/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: fromEmail, name: "Kingdom Sponsor" },
+        subject,
+        content: [{ type: "text/plain", value: text }],
+      }),
+    });
+    if (!res.ok) console.error(`intruder-alert email failed (${res.status}):`, await res.text().catch(() => ""));
+    return res.ok;
+  } catch (e) {
+    console.error("intruder-alert email failed:", e);
+    return false;
+  }
+}
+
+/** Sends the drafted warning through every configured channel. */
+async function notifyIntruderAlert(
+  env: Bindings,
+  rows: FailedLoginRow[],
+): Promise<{ telegramSent: boolean; smsSent: boolean; emailSent: boolean }> {
+  const text = buildIntruderAlertText(rows);
+  let telegramSent = false;
+
+  const tokenRow = await env.DB.prepare(
+    "SELECT value FROM admin_settings WHERE key = 'telegram_bot_token'"
+  ).first<Record<string, any>>();
+  const chatIdRow = await env.DB.prepare(
+    "SELECT value FROM admin_settings WHERE key = 'telegram_chat_id'"
+  ).first<Record<string, any>>();
+  const token = tokenRow?.value as string | undefined;
+  const chatId = chatIdRow?.value as string | undefined;
+
+  if (token && chatId) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text }),
+      });
+      telegramSent = res.ok;
+      if (!res.ok) console.error(`intruder-alert telegram failed (${res.status}):`, await res.text().catch(() => ""));
+    } catch (e) {
+      console.error("intruder-alert telegram failed:", e);
+    }
+  }
+
+  // Short SMS + in-app push to superadmins (SMS must stay brief for one part).
+  const short = `⚠️ Kingdom Sponsor: ${rows.length} failed login attempt${rows.length === 1 ? "" : "s"} (${rows
+    .map((r) => r.phone)
+    .join(", ")}). Check the admin panel.`;
+  await pushAndSmsAdmins(env, short, "Intruder alert", text);
+
+  const emailSent = await sendAdminEmail(env, `Kingdom Sponsor security alert (${rows.length})`, text);
+
+  return { telegramSent, smsSent: true, emailSent };
+}
+
+/** Scheduled scan: alert once about every failed login that hasn't been
+ *  reported yet (only runs when the intruder-alert toggle is on). */
+async function runIntruderAlerts(env: Bindings): Promise<void> {
+  const flag = await env.DB.prepare(
+    "SELECT value FROM admin_settings WHERE key = 'intruder_alert_telegram'"
+  ).first<Record<string, any>>();
+  if (flag?.value !== "1") return;
+
+  const rows = await env.DB.prepare(
+    "SELECT id, phone, ip, user_agent, reason, created_at FROM failed_logins WHERE notified = 0 ORDER BY id ASC LIMIT 20"
+  ).all<FailedLoginRow>();
+  if (!rows.results.length) return;
+
+  await notifyIntruderAlert(env, rows.results);
+  const ids = rows.results.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(",");
+  await env.DB.prepare(
+    `UPDATE failed_logins SET notified = 1 WHERE id IN (${placeholders})`
+  ).bind(...ids).run();
+  console.log(`intruder-alert: reported ${ids.length} failed login(s)`);
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()
@@ -168,7 +308,7 @@ async function authUser(c: any): Promise<TokenPayload | null> {
   const remaining = payload.exp - Math.floor(Date.now() / 1000);
   if (remaining < 60 * 86400) {
     const fresh = await signToken(
-      { sub: payload.sub, phone: payload.phone, isHost: payload.isHost },
+      { sub: payload.sub, phone: payload.phone, isHost: payload.isHost, username: payload.username },
       c.env.JWT_SECRET as string
     );
     c.header("x-refresh-token", fresh);
@@ -248,6 +388,21 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
       `Thank you! Your gift of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign?.title ?? "campaign"}" is confirmed.`,
       { type: "donation_confirmed", campaignId: String(campaign?.id ?? ""), contributionId: String(row.id) })
       .catch((e) => console.error("donor push failed:", e));
+
+    // Donor joined notification: if this is the donor's first confirmed contribution.
+    if (row.donor_user_id) {
+      const firstCount = Number(
+        (await env.DB.prepare(
+          "SELECT COUNT(*) AS c FROM contributions WHERE donor_user_id = ? AND status = 'confirmed'"
+        ).bind(row.donor_user_id).first<{ c: number }>())?.c ?? 0
+      ) === 1;
+      if (firstCount) {
+        await pushToUser(env, campaign?.host_user_id, "New donor joined",
+          `${campaign?.title ?? "Your campaign"} just received its first gift from a new supporter.`,
+          { type: "new_donor", campaignId: String(campaign?.id ?? "") })
+          .catch((e) => console.error("new donor push failed:", e));
+      }
+    }
   }
 
   // Milestone notifications: alert a campaign's donors when it crosses 25/50/75/100% of its goal.
@@ -312,6 +467,7 @@ async function maybeAutoDisburse(env: Bindings, campaignId: number): Promise<voi
  * collection fees (lipilaFeeCents) are NOT subtracted here — they are
  * already paid by the donor on top of their gift amount.
  */
+async function availableBalance(env: Bindings, campaignId: number): Promise<number> {
 const [raised, withdrawn, disbursementFees, payoutPlatformFees] = await env.DB.batch([
     env.DB.prepare("SELECT COALESCE(SUM(amount_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'").bind(campaignId),
     env.DB.prepare("SELECT COALESCE(SUM(amount_cents),0) AS s FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','success')").bind(campaignId),
@@ -686,7 +842,8 @@ async function runPledgeReminders(env: Bindings): Promise<void> {
   ).bind(today, daysInMonth).all<Record<string, any>>();
 
   for (const row of rows.results) {
-    const message = pledgeReminderSms(row.campaign_title, row.amount_cents, row.campaign_id, env.APP_URL);
+    const shortLink = await shortenUrl(env, `${env.APP_URL}/share/${row.campaign_id}`);
+    const message = pledgeReminderSms(row.campaign_title, row.amount_cents, shortLink);
     await smsIfNoPush(env, row.user_id, row.phone, message);
 
     // Push notification
@@ -857,9 +1014,10 @@ app.post("/api/auth/verify-otp", async (c) => {
     }, 403);
   }
 
-  const token = await signToken({ sub: user.id, phone: user.phone, isHost: !!user.is_host }, c.env.JWT_SECRET);
+  const token = await signToken({ sub: user.id, phone: user.phone, isHost: !!user.is_host, username: user.username, notifications_enabled: user.notifications_enabled }, c.env.JWT_SECRET);
   return c.json({
     token,
+    isNewUser,
     user: {
       id: user.id,
       phone: user.phone,
@@ -879,6 +1037,9 @@ app.post("/api/auth/verify-otp", async (c) => {
 // ---------- Admin: SMS network status text ----------
 
 app.get("/api/admin/sms-status", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
   const row = await c.env.DB.prepare(
     "SELECT value FROM admin_settings WHERE key = 'sms_status'"
   ).first<Record<string, any>>();
@@ -901,9 +1062,62 @@ app.put("/api/admin/sms-status", async (c) => {
   return c.json({ ok: true });
 });
 
-// ---------- Admin: Failed login attempts (intruder detection) ----------
+// ---------- Admin: Monthly reminder (pledge) management ----------
 
-app.post("/api/admin/intruder-alert", async (c) => {
+app.get("/api/admin/pledges", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT p.id, p.campaign_id, p.user_id, u.username, u.phone,
+           c.title AS campaign_title, p.amount_cents, p.day_of_month,
+           p.active, p.last_reminded_at, p.created_at
+     FROM recurring_pledges p
+     JOIN users u ON u.id = p.user_id
+     JOIN campaigns c ON c.id = p.campaign_id
+     WHERE p.active = 1
+     ORDER BY p.created_at DESC
+     LIMIT 100`
+  ).all<Record<string, any>>();
+
+  return c.json({
+    pledges: rows.results.map((p) => ({
+      id: p.id,
+      campaignId: p.campaign_id,
+      campaignTitle: p.campaign_title,
+      userId: p.user_id,
+      username: p.username,
+      phone: p.phone,
+      amountCents: p.amount_cents,
+      dayOfMonth: p.day_of_month,
+      active: p.active,
+      lastRemindedAt: p.last_reminded_at,
+      createdAt: p.created_at,
+    })),
+  });
+});
+
+app.post("/api/admin/pledges/:id/cancel", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const id = Number(c.req.param("id"));
+  if (!id) return c.json({ error: "Invalid pledge id" }, 400);
+
+  const res = await c.env.DB.prepare(
+    "UPDATE recurring_pledges SET active = 0 WHERE id = ?"
+  ).bind(id).run();
+
+  if ((res.meta?.changes ?? 0) === 0) {
+    return c.json({ error: "Pledge not found or already inactive" }, 404);
+  }
+
+  return c.json({ ok: true });
+});
+
+
+
+app.get("/api/admin/intruder-alert", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
 
@@ -982,51 +1196,145 @@ app.put("/api/admin/telegram-config", async (c) => {
   return c.json({ ok: true });
 });
 
-// Admin: trigger a test intruder alert (Telegram + SMS).
+// Admin: trigger a test intruder alert (Telegram + SMS + email).
 app.post("/api/admin/intruder-alert/test", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
 
-  const tokenRow = await c.env.DB.prepare(
-    "SELECT value FROM admin_settings WHERE key = 'telegram_bot_token'"
+  const result = await notifyIntruderAlert(c.env, [{
+    id: 0,
+    phone: "test",
+    ip: "0.0.0.0",
+    user_agent: "manual test from the admin panel",
+    reason: "wrong_code",
+    created_at: new Date().toISOString(),
+  }]);
+
+  return c.json({ ok: true, ...result });
+});
+
+// Admin: configure the email address for alert emails.
+app.get("/api/admin/email-config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const row = await c.env.DB.prepare(
+    "SELECT value FROM admin_settings WHERE key = 'admin_email'"
   ).first<Record<string, any>>();
-  const chatIdRow = await c.env.DB.prepare(
-    "SELECT value FROM admin_settings WHERE key = 'telegram_chat_id'"
-  ).first<Record<string, any>>();
 
-  const token = tokenRow?.value as string?;
-  const chatId = chatIdRow?.value as string?;
+  return c.json({ configured: !!row?.value, email: row?.value ?? "" });
+});
 
-  let telegramSent = false;
-  let smsSent = false;
+app.put("/api/admin/email-config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
 
-  if (token && chatId) {
-    try {
-      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: '🚨 INTRUDER ALERT: Failed login attempt detected on Kingdom Sponsor.',
-        }),
-      });
-      telegramSent = true;
-    } catch (_) {}
+  const body = await c.req.json();
+  const email = body.email != null ? String(body.email).trim() : null;
+  if (email == null) return c.json({ error: "email required" }, 400);
+
+  await c.env.DB.prepare(
+    "INSERT INTO admin_settings (key, value) VALUES ('admin_email', ?) " +
+    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).bind(email).run();
+
+  return c.json({ ok: true, email });
+});
+
+// ---------- admin backup / restore ----------
+
+const BACKUP_TABLES = [
+  "app_settings", "users", "campaigns", "contributions", "withdrawals", "otps",
+  "campaign_sponsors", "user_links", "device_tokens", "referrals", "refunds",
+  "admin_settings", "failed_logins", "support_tickets", "campaign_delete_requests",
+  "receipt_downloads", "announcements", "short_links", "sms_events", "fee_sweeps",
+  "recurring_pledges", "promotions",
+];
+
+// Child-first so FK-friendly deletes succeed; inserts then run parent-first.
+const BACKUP_DELETE_ORDER = [
+  "device_tokens", "receipt_downloads", "user_links", "referrals", "sms_events",
+  "campaign_delete_requests", "announcements", "promotions", "recurring_pledges",
+  "short_links", "support_tickets", "refunds", "fee_sweeps", "failed_logins",
+  "admin_settings", "otps", "campaign_sponsors", "contributions", "withdrawals",
+  "campaigns", "users", "app_settings",
+];
+
+app.get("/api/admin/backup/export", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const tables: Record<string, any[]> = {};
+  for (const name of BACKUP_TABLES) {
+    const exists = await c.env.DB.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
+    ).bind(name).first();
+    if (!exists) continue;
+    const { results } = await c.env.DB.prepare(`SELECT * FROM "${name}"`).all();
+    tables[name] = results as any[];
   }
 
-  // Also send SMS to superadmin if configured.
-  const superadminRow = await c.env.DB.prepare(
-    "SELECT value FROM admin_settings WHERE key = 'superadmin_phones'"
-  ).first<Record<string, any>>();
-  const superadminPhones = superadminRow?.value as string?;
-  if (superadminPhones) {
-    try {
-      await sendSms(c.env, superadminPhones, '🚨 INTRUDER ALERT: Failed login attempt on Kingdom Sponsor.');
-      smsSent = true;
-    } catch (_) {}
+  return c.json({ exportedAt: new Date().toISOString(), app: "kingdom-sponsor", tables });
+});
+
+app.post("/api/admin/backup/restore", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json();
+  if (body.confirm !== true) return c.json({ error: "confirm: true required" }, 400);
+  const incoming = (body.tables ?? {}) as Record<string, any[]>;
+  const names = Object.keys(incoming);
+  if (names.length === 0) return c.json({ error: "tables required" }, 400);
+
+  for (const name of names) {
+    if (!BACKUP_TABLES.includes(name)) {
+      return c.json({ error: `table not allowed: ${name}` }, 400);
+    }
   }
 
-  return c.json({ ok: true, telegramSent, smsSent });
+  const stmts: any[] = [];
+  for (const name of BACKUP_DELETE_ORDER) {
+    if (incoming[name]) stmts.push(c.env.DB.prepare(`DELETE FROM "${name}"`));
+  }
+  for (const name of names) {
+    const rows = incoming[name];
+    if (!Array.isArray(rows) || rows.length === 0) continue;
+    const cols = Object.keys(rows[0]);
+    if (cols.length === 0) continue;
+    for (const row of rows) {
+      const placeholders = cols.map(() => "?").join(", ");
+      const values = cols.map((col) => (row[col] === undefined ? null : row[col]));
+      stmts.push(
+        c.env.DB.prepare(
+          `INSERT INTO "${name}" (${cols.map((col) => `"${col}"`).join(", ")}) VALUES (${placeholders})`
+        ).bind(...values)
+      );
+    }
+  }
+
+  for (let i = 0; i < stmts.length; i += 50) {
+    await c.env.DB.batch(stmts.slice(i, i + 50));
+  }
+
+  return c.json({ ok: true, restoredTables: names });
+});
+
+// ---------- admin short-link stats ----------
+
+app.get("/api/admin/short-links", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const rows = await c.env.DB.prepare(
+    "SELECT sl.long_url, sl.short_url, sl.clicks, sl.created_at, " +
+    "c.id AS campaign_id, c.title AS campaign_title " +
+    "FROM short_links sl " +
+    "LEFT JOIN campaigns c ON c.id = CAST(SUBSTR(sl.long_url, INSTR(sl.long_url, '/share/') + 7) AS INTEGER) " +
+    "ORDER BY sl.clicks DESC LIMIT 100"
+  ).all<Record<string, any>>();
+
+  return c.json({ links: rows.results ?? [] });
 });
 
 // ---------- public campaign views ----------
@@ -1080,15 +1388,33 @@ async function campaignPublic(env: Bindings, row: Record<string, any>): Promise<
     promotedUntil: row.promoted_until ?? null,
     status: row.status,
     createdAt: row.created_at,
+    shareUrl: await shortenUrl(env, `${env.APP_URL}/share/${row.id}`),
   };
 }
 
 app.get("/api/campaigns", async (c) => {
   const rows = await c.env.DB.prepare(
-    "SELECT * FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC"
+    "SELECT * FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC LIMIT 100"
   ).all<Record<string, any>>();
   const out = [];
-  for (const row of rows.results) out.push(await campaignPublic(c.env, row));
+  for (const row of rows.results) {
+    try {
+      out.push(await campaignPublic(c.env, row));
+    } catch (e) {
+      console.error(`campaignPublic failed for campaign ${row.id}:`, e);
+      // Include minimal campaign data so the list still shows
+      out.push({
+        id: row.id, slug: row.slug, title: row.title, description: row.description,
+        blurb: String(row.description ?? "").slice(0, 140), imageUrl: row.image_url,
+        logoUrl: row.logo_url ?? null, goalCents: Number(row.goal_cents),
+        hasGoal: Number(row.goal_cents) > 0, raisedCents: 0, withdrawnCents: 0,
+        donorCount: 0, donationCount: 0, avgDonationCents: 0, donorsNeededAtAvg: null,
+        dailyRateCents: 0, estimatedEndDate: null, endsAt: row.ends_at ?? null,
+        promoted: !!row.promoted, promotedUntil: row.promoted_until ?? null,
+        status: row.status, createdAt: row.created_at, shareUrl: null,
+      });
+    }
+  }
   c.header("Cache-Control", "public, max-age=30");
   return c.json({ campaigns: out });
 });
@@ -1151,17 +1477,18 @@ app.get("/api/campaigns/:id", async (c) => {
   }
 
   const leaderboard = await c.env.DB.prepare(
-    `SELECT co.donor_user_id, u.username, SUM(co.amount_cents) AS total
+    `SELECT co.donor_user_id, u.username, co.phone, SUM(co.amount_cents) AS total
      FROM contributions co LEFT JOIN users u ON u.id = co.donor_user_id
      WHERE co.campaign_id = ? AND co.status = 'confirmed' AND co.hide_amount = 0
-     GROUP BY co.donor_user_id ORDER BY total DESC LIMIT 5`
+     GROUP BY (CASE WHEN co.donor_user_id IS NULL THEN 'a' || co.phone ELSE 'u' || co.donor_user_id END)
+     ORDER BY total DESC`
   ).bind(row.id).all<Record<string, any>>();
 
   return c.json({
     campaign: pub,
     donors: donorList,
     leaderboard: leaderboard.results.map((l) => ({
-      username: l.username ?? "Giver",
+      username: l.username ?? (l.phone ? `Giver${String(l.phone).slice(-4)}` : "Giver"),
       totalCents: l.total,
       tier: tierFor(l.total),
     })),
@@ -1249,7 +1576,22 @@ app.post("/api/campaigns", async (c) => {
     "INSERT INTO campaigns (slug, title, description, goal_cents, min_withdraw_cents, host_user_id, ends_at, min_sponsors) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
   ).bind(slug, title, description, goalCents, minWithdrawCents, user.sub, endsAt, minSponsors).run();
 
-  return c.json({ id: r.meta.last_row_id, slug }, 201);
+  const campaignId = Number(r.meta?.last_row_id ?? 0);
+
+  // Notify past donors of this host's campaigns about the new campaign.
+  const pastDonors = await c.env.DB.prepare(
+    "SELECT DISTINCT u.id, u.fcm_token FROM contributions co JOIN campaigns c ON c.id = co.campaign_id JOIN users u ON u.id = co.donor_user_id WHERE c.host_user_id = ? AND u.fcm_token IS NOT NULL LIMIT 50"
+  ).bind(user.sub).all<{ id: number; fcm_token: string }>();
+  if (pastDonors.results.length && envPushConfigured(c.env)) {
+    const tokens = pastDonors.results.map((u) => u.fcm_token);
+    const donorIds = pastDonors.results.map((u) => u.id);
+    await sendMulticastPush(fbEnv(c.env), tokens, "New campaign posted",
+      `${user.username ?? "Someone you support"} just started "${title}". Give now on Kingdom Sponsor.`,
+      { type: "new_campaign", campaignId: String(campaignId) }
+    ).catch((e) => console.error("new campaign push failed:", e));
+  }
+
+  return c.json({ id: campaignId, slug }, 201);
 });
 
 // ---------- Admin: Update campaign (title, description, goal, etc.) ----------
@@ -1307,6 +1649,20 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   const updated = await c.env.DB.prepare(
     "SELECT * FROM campaigns WHERE id = ?"
   ).bind(campaign.id).first<Record<string, any>>();
+
+  // Notify past donors of significant campaign updates (transparency).
+  if (title !== null || description !== null || goalCents !== null || status !== null) {
+    const donors = await c.env.DB.prepare(
+      "SELECT DISTINCT u.id, u.fcm_token FROM contributions co JOIN users u ON u.id = co.donor_user_id WHERE co.campaign_id = ? AND u.fcm_token IS NOT NULL LIMIT 50"
+    ).bind(campaign.id).all<{ id: number; fcm_token: string }>();
+    if (donors.results.length && envPushConfigured(c.env)) {
+      const tokens = donors.results.map((u) => u.fcm_token);
+      await sendMulticastPush(fbEnv(c.env), tokens, "Campaign updated",
+        `"${title ?? campaign.title}" has been updated by the host.`,
+        { type: "campaign_updated", campaignId: String(campaign.id) }
+      ).catch((e) => console.error("campaign-updated push failed:", e));
+    }
+  }
 
   return c.json({ ok: true, campaign: updated });
 });
@@ -1490,6 +1846,25 @@ app.post("/api/device/token", async (c) => {
   ]);
 
   return c.json({ ok: true });
+});
+
+// ---------- push notification preferences ----------
+
+app.get("/api/user/notifications", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  return c.json({ enabled: user.notifications_enabled === 1 });
+});
+
+app.put("/api/user/notifications", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const body = await c.req.json();
+  const enabled = body.enabled === true || body.enabled === "true";
+  await c.env.DB.prepare(
+    "UPDATE users SET notifications_enabled = ? WHERE id = ?"
+  ).bind(enabled ? 1 : 0, user.sub).run();
+  return c.json({ ok: true, enabled });
 });
 
 // ---------- account deletion (Google Play compliance) ----------
@@ -1870,14 +2245,17 @@ app.post("/api/user/link", async (c) => {
     return c.json({ error: "Link already exists", status: existing.status }, 400);
   }
 
-  await c.env.DB.prepare(
+  const linkRes = await c.env.DB.prepare(
     "INSERT INTO user_links (user_id, linked_user_id, link_type, status) VALUES (?, ?, ?, 'pending')"
   ).bind(user.sub, target.id, linkType).run();
 
-  // Send SMS to target user
+  // Send SMS to target user with deep link to accept/reject
+  const linkId = Number(linkRes.meta?.last_row_id ?? 0);
   const me = await c.env.DB.prepare("SELECT username FROM users WHERE id = ?").bind(user.sub).first<{ username: string }>();
+  const acceptLink = `${c.env.APP_URL}/links/${linkId}/accept`;
+  const rejectLink = `${c.env.APP_URL}/links/${linkId}/reject`;
   await sendSms(c.env, target.phone,
-    `${me?.username ?? "A Kingdom Sponsor user"} wants to link accounts as ${linkType}. Open Kingdom Sponsor to accept.`
+    `${me?.username ?? "A Kingdom Sponsor user"} wants to link as ${linkType}. Accept: ${acceptLink}  Decline: ${rejectLink}  (or open the app)`
   ).catch((e) => console.error("link sms failed:", e));
 
   return c.json({ ok: true, message: "Link request sent. Waiting for acceptance." });
@@ -1930,6 +2308,48 @@ app.post("/api/user/links/:id/reject", async (c) => {
   ).bind(c.req.param("id"), user.sub).run();
 
   return c.json({ ok: true, message: "Link request rejected." });
+});
+
+// ---------- account link detail + combined donations ----------
+
+app.get("/api/user/links/:id/donations", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const linkId = Number(c.req.param("id"));
+  if (!linkId) return c.json({ error: "Invalid link id" }, 400);
+
+  const link = await c.env.DB.prepare(
+    "SELECT * FROM user_links WHERE id = ? AND (user_id = ? OR linked_user_id = ?) AND status = 'accepted'"
+  ).bind(linkId, user.sub, user.sub).first<Record<string, any>>();
+  if (!link) return c.json({ error: "Link not found" }, 404);
+
+  const otherUserId = link.user_id === user.sub ? link.linked_user_id : link.user_id;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT co.*, cam.title AS campaign_title, u.username, u.avatar_url,
+            CASE WHEN co.donor_user_id = ? THEN 1 ELSE 0 END AS is_mine
+     FROM contributions co
+     JOIN campaigns cam ON cam.id = co.campaign_id
+     LEFT JOIN users u ON u.id = co.donor_user_id
+     WHERE co.donor_user_id IN (?, ?) AND co.status = 'confirmed'
+     ORDER BY co.created_at DESC LIMIT 100`
+  ).bind(user.sub, user.sub, otherUserId).all<Record<string, any>>();
+
+  return c.json({
+    donations: rows.results.map((d) => ({
+      id: d.id,
+      amountCents: d.amount_cents,
+      campaignId: d.campaign_id,
+      campaignTitle: d.campaign_title,
+      displayName: d.is_anonymous ? 'Anonymous' : (d.donor_name || d.username || 'Giver'),
+      username: d.username,
+      avatarUrl: d.avatar_url,
+      isAnonymous: d.is_anonymous == 1,
+      isMine: d.is_mine == 1,
+      createdAt: d.created_at,
+    })),
+  });
 });
 
 app.delete("/api/user/links/:id", async (c) => {
@@ -2088,7 +2508,8 @@ app.get("/api/me/referral", async (c) => {
   const user = await authUser(c);
   if (!user) return c.json({ error: "Not authenticated" }, 401);
   const code = await ensureReferralCode(c.env, user.sub);
-  return c.json({ code, shareUrl: `${c.env.APP_URL}/share?ref=${code}` });
+  const shareUrl = await shortenUrl(c.env, `${c.env.APP_URL}/share?ref=${code}`);
+  return c.json({ code, shareUrl });
 });
 
 app.get("/api/me/referrals", async (c) => {
@@ -2133,7 +2554,7 @@ interface ReceiptInput {
   status: string;
 }
 
-async function buildReceiptPdf(i: ReceiptInput): Promise<Uint8Array> {
+async function buildReceiptPdf(env: Bindings, i: ReceiptInput): Promise<Uint8Array> {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const bold = await doc.embedFont(StandardFonts.HelveticaBold);
@@ -2148,18 +2569,42 @@ async function buildReceiptPdf(i: ReceiptInput): Promise<Uint8Array> {
 
   // Header band
   page.drawRectangle({
-    x: 0, y: page.getSize().height - 80, width: width, height: 80,
+    x: 0, y: page.getSize().height - 70, width: width, height: 70,
     color: primaryColor,
   });
-  // Logo placeholder (gold circle)
-  page.drawCircle({
-    x: width - 60, y: page.getSize().height - 40,
-    size: 36, color: goldColor,
-  });
-  page.drawText("Kingdom\nSponsor", { x: 50, y: page.getSize().height - 28, size: 20, font: bold, color: rgb(1, 1, 1) });
-  page.drawText("Official Donation Receipt", { x: 50, y: page.getSize().height - 52, size: 12, font, color: rgb(0.95, 0.95, 0.97) });
 
-  let y = page.getSize().height - 100;
+  // App logo from R2 (falls back to gold circle if unavailable)
+  try {
+    const logoObj = await env.MEDIA.get("app-logo.jpg");
+    if (logoObj?.body) {
+      const logoBytes = await logoObj.body.getReader().read().then(({ value }) => value ?? new Uint8Array(0));
+      const logoImg = await doc.embedJpg(logoBytes);
+      const logoW = 48;
+      const logoH = 48;
+      page.drawImage(logoImg, {
+        x: width - 60 - logoW / 2,
+        y: page.getSize().height - 45 - logoH / 2,
+        width: logoW,
+        height: logoH,
+      });
+    } else {
+      // Logo placeholder (gold circle)
+      page.drawCircle({
+        x: width - 60, y: page.getSize().height - 40,
+        size: 36, color: goldColor,
+      });
+    }
+  } catch {
+    page.drawCircle({
+      x: width - 60, y: page.getSize().height - 40,
+      size: 36, color: goldColor,
+    });
+  }
+
+  page.drawText("Kingdom Sponsor", { x: 50, y: page.getSize().height - 32, size: 16, font: bold, color: rgb(1, 1, 1) });
+  page.drawText("Official Donation Receipt", { x: 50, y: page.getSize().height - 48, size: 10, font, color: rgb(0.95, 0.95, 0.97) });
+
+  let y = page.getSize().height - 90;
   page.drawRectangle({
     x: 50, y: y - 4, width: width - 100, height: 1,
     color: rgb(0.8, 0.85, 0.92),
@@ -2192,9 +2637,9 @@ async function buildReceiptPdf(i: ReceiptInput): Promise<Uint8Array> {
   page.drawText(`K${(i.amountCents / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, { x: 280, y, size: 12, font: bold });
 
   y -= 18;
-  page.drawText("Processing fee (platform 1% min K3 + gateway):", { x: 50, y, size: 10, font, color: textMuted });
-  const processingFee = i.platformFeeCents + i.lipilaFeeCents;
-  page.drawText(`- K${(processingFee / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, { x: 280, y, size: 10, font: bold, color: textMuted });
+  page.drawText("Platform fees:", { x: 50, y, size: 10, font, color: textMuted });
+  const platformFees = i.platformFeeCents + i.lipilaFeeCents;
+  page.drawText(`K${(platformFees / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, { x: 280, y, size: 10, font: bold, color: textMuted });
 
   y -= 18;
   page.drawText("Total paid by donor:", { x: 50, y, size: 10, font: bold, color: textMuted });
@@ -2214,7 +2659,7 @@ async function buildReceiptPdf(i: ReceiptInput): Promise<Uint8Array> {
   y -= 14;
   page.drawText("This receipt was issued automatically and records your gift for your records.", { x: 50, y, size: 9, font, color: textMuted });
   y -= 12;
-  page.drawText("Kingdom Sponsor  •  kingdom-sponsor.app  •  Built with purpose", { x: 50, y, size: 8, font, color: rgb(0.55, 0.55, 0.55) });
+  page.drawText("Kingdom Sponsor  •  Built with Purpose", { x: 50, y, size: 8, font, color: rgb(0.55, 0.55, 0.55) });
 
   return doc.save();
 }
@@ -2247,7 +2692,7 @@ app.get("/api/contributions/:id/receipt", async (c) => {
   ).bind(row.id, user.sub, user.phone).run();
 
   const donorName = row.is_anonymous ? "Anonymous" : (String(row.donor_name ?? "").trim() || "Anonymous");
-  const pdf = await buildReceiptPdf({
+  const pdf = await buildReceiptPdf(c.env, {
     receiptNumber: `KS-${String(row.id).padStart(6, "0")}`,
     donorName,
     donorPhone: row.phone,
@@ -2404,6 +2849,33 @@ app.get("/api/admin/tickets", async (c) => {
       updatedAt: t.updated_at,
     })),
   });
+});
+
+// ---------- admin: resolve a support ticket ----------
+
+app.put("/api/admin/tickets/:id/resolve", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const id = Number(c.req.param("id"));
+  if (!id) return c.json({ error: "Invalid ticket id" }, 400);
+
+  const row = await c.env.DB.prepare(
+    "SELECT t.*, u.id AS user_id, u.fcm_token FROM support_tickets t LEFT JOIN users u ON u.id = t.user_id WHERE t.id = ?"
+  ).bind(id).first<Record<string, any>>();
+  if (!row) return c.json({ error: "Ticket not found" }, 404);
+
+  await c.env.DB.prepare(
+    "UPDATE support_tickets SET status = 'resolved', updated_at = datetime('now') WHERE id = ?"
+  ).bind(id).run();
+
+  // Notify the user that their ticket was resolved.
+  await pushToUser(c.env, row.user_id, "Support request resolved",
+    `Your support ticket #${id}${row.subject ? ` "${row.subject}"` : ""} has been resolved. Thank you for your patience.`,
+    { type: "ticket_resolved", ticketId: String(id) })
+    .catch((e) => console.error("ticket-resolved push failed:", e));
+
+  return c.json({ ok: true, message: "Ticket resolved" });
 });
 
 // ---------- campaign deletion (admin only) + host delete requests ----------
@@ -3417,6 +3889,78 @@ app.get("/api/admin/disbursements", async (c) => {
   return c.json({ disbursements: out });
 });
 
+// ---------- Superadmin manual disbursement trigger ----------
+
+app.post("/api/admin/disburse", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json().catch(() => ({}));
+  const campaignId = Number(body.campaignId) || 0;
+
+  if (campaignId) {
+    const result = await createWithdrawal(c.env, campaignId);
+    return c.json({ ok: true, campaignId, payoutCents: result, message: result > 0 ? `Payout of K${(result / 100).toLocaleString()} initiated` : 'No payout: balance below minimum or zero' });
+  }
+
+  // Trigger all
+  await runAutoDisburse(c.env);
+  return c.json({ ok: true, message: 'Auto-disburse triggered for all active campaigns'   });
+});
+
+// ---------- Admin: send test push notification ----------
+
+app.post("/api/admin/test-push", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json().catch(() => ({}));
+  const userId = Number(body.userId) || admin.sub;
+
+  await pushToUser(c.env, userId, "Kingdom Sponsor Test", "This is a test push notification from the admin dashboard.", { type: "test" });
+  return c.json({ ok: true, message: "Test push sent to user " + userId });
+});
+
+// ---------- Lipila wallet balance (superadmin) ----------
+
+app.get("/api/admin/wallet-balance", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  try {
+    const balanceCents = await getWalletBalance(c.env as LipilaEnv);
+    return c.json({ balanceCents, balanceKwacha: balanceCents / 100 });
+  } catch (e) {
+    return c.json({ balanceCents: 0, balanceKwacha: 0 });
+  }
+});
+
+// ---------- Superadmin manual withdraw ----------
+
+app.post("/api/admin/withdraw", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const amountCents = Math.round(Number(body.amountCents) || 0);
+  const phone = String(body.phone ?? "").trim();
+  if (amountCents < 100) return c.json({ error: "Minimum withdraw is K1" }, 400);
+  if (!phone || phone.length < 10) return c.json({ error: "Valid phone number required" }, 400);
+  const referenceId = `ADMIN-WITHDRAW-${Date.now()}`;
+  const cleanPhone = phone.replace("+", "").replace(/\s/g, "");
+  try {
+    const result = await createDisbursement(c.env, {
+      referenceId, amountCents, accountNumber: cleanPhone,
+      narration: "Kingdom Sponsor admin withdrawal",
+      callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
+    });
+    await c.env.DB.prepare(
+      "INSERT INTO fee_sweeps (kind, amount_cents, lipila_reference, status) VALUES (?, ?, ?, 'pending')"
+    ).bind("admin_withdraw", amountCents, referenceId).run();
+    return c.json({ ok: true, referenceId, identifier: result.identifier, message: `Withdrawal of K${(amountCents / 100).toLocaleString()} initiated to ${phone}` });
+  } catch (e) {
+    return c.json({ error: `Withdrawal failed: ${e}` }, 500);
+  }
+});
+
 app.get("/api/admin/campaigns", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
@@ -3532,6 +4076,12 @@ app.get("/share/:id", async (c) => {
     .bind(id).first<Record<string, any>>();
   if (!campaign) return c.json({ error: "Campaign not found" }, 404);
 
+  const longUrl = c.env.APP_URL + "/share/" + id;
+  await c.env.DB.prepare(
+    "INSERT INTO short_links (long_url, short_url, clicks) VALUES (?, ?, 0) " +
+    "ON CONFLICT(long_url) DO UPDATE SET clicks = short_links.clicks + 1"
+  ).bind(longUrl, longUrl).run();
+
   const pub = await campaignPublic(c.env, campaign);
   const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : "";
   const pageUrl = c.env.APP_URL + "/share/" + id + refQuery;
@@ -3543,6 +4093,23 @@ app.get("/share/:id", async (c) => {
   const ogImage = pub.imageUrl ? "<meta property=\"og:image\" content=\"" + pub.imageUrl + "\">" : "";
   const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta property=\"og:title\" content=\"" + pub.title + "\"><meta property=\"og:description\" content=\"" + pub.blurb + "\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:url\" content=\"" + pageUrl + "\">" + ogImage + "<meta name=\"theme-color\" content=\"#1d4ed8\"><title>" + pub.title + " - Kingdom Sponsor</title><style>" + SHARE_STYLE + "</style></head><body><div class=\"card\">" + (pub.imageUrl ? "<img src=\"" + pub.imageUrl + "\" alt=\"\" style=\"width:96px;height:96px;border-radius:16px;margin-bottom:12px;object-fit:cover\">" : "") + "<h1>" + pub.title + "</h1><p>" + pub.blurb + "</p>" + goalLine + "<a class=\"btn\" href=\"" + wa + "\" target=\"_blank\">Share on WhatsApp</a><a class=\"btn2\" href=\"kingdomsponsor://campaign/" + id + (refQuery ? "&ref=" + encodeURIComponent(ref) : "") + "\">Open in app</a><a class=\"btn3\" href=\"https://play.google.com/store/apps/details?id=com.kingdomsponsor.app\" target=\"_blank\">Don't have the app? Get it on Play Store</a><div class=\"foot\">" + (pub.donorCount ?? 0) + " givers - " + endsLine + "</div></div></body></html>";
   return c.html(html);
+});
+
+// Short-link redirect: increments click count and 302-redirects to the long URL.
+app.get("/go/:code", async (c) => {
+  const code = c.req.param("code");
+  const row = await c.env.DB.prepare(
+    "SELECT long_url FROM short_links WHERE short_url = ?"
+  )
+    .bind(`${c.env.APP_URL}/go/${code}`)
+    .first<{ long_url: string }>();
+  if (!row) return c.json({ error: "Link not found" }, 404);
+  await c.env.DB.prepare(
+    "UPDATE short_links SET clicks = clicks + 1 WHERE short_url = ?"
+  )
+    .bind(`${c.env.APP_URL}/go/${code}`)
+    .run();
+  return c.redirect(row.long_url, 302);
 });
 
 // Lightweight widget for embedding a campaign on any website (use as <iframe src=".../share/:id/embed">).
@@ -3763,6 +4330,38 @@ app.post("/api/ussd", async (c) => {
   return c.text("END Thank you for using Kingdom Sponsor. Goodbye!");
 });
 
+// ---------- Account link accept/reject (web deep-link landing) ----------
+
+app.get("/links/:id/accept", async (c) => {
+  const linkId = Number(c.req.param("id"));
+  if (!linkId) return c.json({ error: "Invalid link id" }, 400);
+
+  const row = await c.env.DB.prepare(
+    "SELECT ul.*, u.username AS sender_username FROM user_links ul JOIN users u ON u.id = ul.user_id WHERE ul.id = ? AND ul.status = 'pending'"
+  ).bind(linkId).first<Record<string, any>>();
+
+  if (!row) return c.text("This link request is no longer pending.", 410);
+
+  const deepLink = `kingdomsponsor://accept-link/${linkId}`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Accept link — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:420px;margin:0 auto;text-align:center}h1{font-size:22px;margin:0 0 12px;color:#34d399}p{color:#94a3b8;line-height:1.5}a.btn{display:block;background:#25D366;color:#06281b;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:12px 0}a.btn2{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:12px 0}</style></head><body><h1>Accept account link?</h1><p>${row.sender_username ?? "Someone"} wants to link their account to yours as ${row.link_type}.</p><a class="btn" href="${deepLink}">Open in app to accept</a><a class="btn2" href="https://play.google.com/store/apps/details?id=com.kingdomsponsor.app">Don't have the app? Get it on Play Store</a></body></html>`;
+  return c.html(html);
+});
+
+app.get("/links/:id/reject", async (c) => {
+  const linkId = Number(c.req.param("id"));
+  if (!linkId) return c.json({ error: "Invalid link id" }, 400);
+
+  const row = await c.env.DB.prepare(
+    "SELECT ul.*, u.username AS sender_username FROM user_links ul JOIN users u ON u.id = ul.user_id WHERE ul.id = ? AND ul.status = 'pending'"
+  ).bind(linkId).first<Record<string, any>>();
+
+  if (!row) return c.text("This link request is no longer pending.", 410);
+
+  const deepLink = `kingdomsponsor://reject-link/${linkId}`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Decline link — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:420px;margin:0 auto;text-align:center}h1{font-size:22px;margin:0 0 12px;color:#34d399}p{color:#94a3b8;line-height:1.5}a.btn{display:block;background:#ef4444;color:#fff;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:12px 0}a.btn2{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:12px 0}</style></head><body><h1>Decline account link?</h1><p>Decline the link request from ${row.sender_username ?? "someone"}.</p><a class="btn" href="${deepLink}">Open in app to decline</a><a class="btn2" href="https://play.google.com/store/apps/details?id=com.kingdomsponsor.app">Don't have the app? Get it on Play Store</a></body></html>`;
+  return c.html(html);
+});
+
 app.get("/privacy", (c) => {
   const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Privacy Policy — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:800px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Privacy Policy</h1><p><strong>Last updated:</strong> August 2026</p><p>Kingdom Sponsor (\"we,\" \"our,\" or \"us\") operates a fundraising platform that allows users to donate to campaigns and hosts to create and manage fundraising campaigns. This privacy policy describes how we collect, use, and protect your personal data.</p><h2>1. Information We Collect</h2><h3>1.1 Account Data</h3><ul><li><strong>Phone number</strong> — required for registration and OTP-based authentication via Africa's Talking SMS</li><li><strong>Username</strong> — chosen during registration</li><li><strong>User ID</strong> — internally generated identifier</li></ul><h3>1.2 Donation Data</h3><ul><li><strong>Amount donated</strong> (in ngwee/cents)</li><li><strong>Donor name</strong> (optional, can be anonymous)</li><li><strong>Phone number</strong> — used for Lipila payment prompts and SMS notifications</li><li><strong>Transaction reference ID</strong> — unique identifier for each donation</li><li><strong>Campaign ID</strong> — the campaign being supported</li></ul><h3>1.3 Campaign Data</h3><ul><li><strong>Campaign title, description, and goal</strong></li><li><strong>Campaign status</strong> (active, draft, ended)</li><li><strong>Logo URL</strong> (if uploaded by the host)</li><li><strong>Sponsor count and amounts</strong></li></ul><h3>1.4 Payment Data</h3><ul><li><strong>Lipila collection and disbursement references</strong></li><li><strong>Payment status</strong> (pending, success, failed, cancelled)</li><li><strong>Platform fees and Lipila fees</strong> (calculated automatically)</li></ul><h3>1.5 USSD Session Data</h3><ul><li><strong>Session ID</strong> — temporary identifier for USSD interactions</li><li><strong>Phone number</strong> — the user's phone dialing the USSD code</li><li><strong>Menu selections</strong> — choices made during the USSD flow</li><li><strong>Donation amount and reference</strong> — recorded when a USSD donation is confirmed</li></ul><h3>1.6 Technical Data</h3><ul><li><strong>IP address</strong> — logged automatically by Cloudflare</li><li><strong>User agent and device information</strong> — collected by the Flutter app</li><li><strong>FCM tokens</strong> — used for push notifications (stored per device)</li></ul><h2>2. How We Use Your Data</h2><ul><li><strong>Authentication</strong> — your phone number is used to send and verify OTPs via Africa's Talking SMS</li><li><strong>Payment processing</strong> — donation amounts and phone numbers are sent to Lipila for mobile money transactions</li><li><strong>SMS notifications</strong> — we send transaction confirmations and pledge reminders via Africa's Talking</li><li><strong>USSD interactions</strong> — your USSD session data is processed in real time to provide the interactive menu experience</li><li><strong>Campaign management</strong> — campaign data is displayed publicly (except donor phone numbers, which are never exposed)</li><li><strong>Analytics and reporting</strong> — aggregated, anonymised data is used for platform statistics and admin dashboards</li><li><strong>Fee calculation</strong> — platform fees and Lipila fees are calculated and deducted automatically from each transaction</li></ul><h2>3. Data Storage</h2><ul><li>All data is stored in <strong>Cloudflare D1</strong> (SQLite) databases</li><li>Media files (campaign logos) are stored in <strong>Cloudflare R2</strong></li><li>No data is stored on our own servers — all infrastructure is provided by Cloudflare</li></ul><h2>4. Data Retention</h2><ul><li><strong>Contributions and transactions</strong> — retained indefinitely for financial records</li><li><strong>USSD session data</strong> — not persisted; processed in real time and discarded after the session ends</li><li><strong>User accounts</strong> — retained until the account is deleted</li><li><strong>Campaigns</strong> — retained until the host ends the campaign</li><li><strong>Payout/withdrawal records</strong> — retained indefinitely</li></ul><h2>5. Data Sharing</h2><p>We do not sell your personal data. We share data only with:</p><ul><li><strong>Lipila</strong> — for payment processing (phone number, amount, reference ID)</li><li><strong>Africa's Talking</strong> — for SMS and USSD services (phone number, session data)</li><li><strong>Cloudflare</strong> — as our infrastructure provider (IP address, technical data)</li><li><strong>Firebase</strong> — for FCM push notifications (device tokens)</li></ul><h2>6. Your Rights</h2><p>You have the right to:</p><ul><li><strong>Access</strong> — request a copy of your personal data</li><li><strong>Rectification</strong> — correct inaccurate information</li><li><strong>Erasure</strong> — request deletion of your account and associated data</li><li><strong>Portability</strong> — receive your data in a machine-readable format</li><li><strong>Object</strong> — object to processing of your data for direct marketing</li></ul><p>To exercise any of these rights, contact us through the platform or reach out to the superadmin.</p><h2>7. Security</h2><ul><li>All API endpoints are protected by JWT authentication</li><li>Phone numbers are never exposed publicly</li><li>Payment data is processed by Lipila and never stored in full</li><li>USSD session data is processed in real time and not persisted</li><li>We use HTTPS for all data transmission</li></ul><h2>8. Children's Privacy</h2><p>Kingdom Sponsor is not intended for users under the age of 13. We do not knowingly collect data from children.</p><h2>9. Changes to This Policy</h2><p>We may update this privacy policy from time to time. Changes will be posted on this page with a new \"Last updated\" date.</p><h2>10. Contact</h2><p>For privacy-related inquiries, contact the platform administrator or the superadmin phone number configured in the backend.</p><p><strong>Platform:</strong> Kingdom Sponsor<br><strong>Backend:</strong> https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev<br><strong>GitHub:</strong> https://github.com/Carpso/chisomo</p></body></html>";
   return c.html(html);
@@ -3773,17 +4372,56 @@ app.get("/delete-account", (c) => {
   return c.html(html);
 });
 
-app.get("/", (c) => c.json({ name: "Kingdom Sponsor API", version: "0.3.0" }));
+app.get("/", (c) => c.json({ name: "Kingdom Sponsor API", version: "0.3.0", pushConfigured: envPushConfigured(c.env) }));
+
+// ---------- Push notification diagnostic (admin) ----------
+
+app.get("/api/admin/push-status", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const pushConfigured = envPushConfigured(c.env);
+  const tokenCount = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM device_tokens"
+  ).first<{ n: number }>();
+  const usersWithTokens = await c.env.DB.prepare(
+    "SELECT COUNT(DISTINCT user_id) AS n FROM device_tokens"
+  ).first<{ n: number }>();
+  const pendingWithdrawals = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM withdrawals WHERE status = 'pending'"
+  ).first<{ n: number }>();
+
+  return c.json({
+    pushConfigured,
+    firebaseEmailConfigured: !!c.env.FIREBASE_CLIENT_EMAIL,
+    firebaseKeyConfigured: !!c.env.FIREBASE_PRIVATE_KEY,
+    totalTokens: tokenCount?.n ?? 0,
+    usersWithTokens: usersWithTokens?.n ?? 0,
+    pendingWithdrawals: pendingWithdrawals?.n ?? 0,
+  });
+});
+
+// ---------- Admin: send test push notification ----------
 
 /** Scheduled: sweep payout-eligible balances for every active campaign. */
 async function runAutoDisburse(env: Bindings): Promise<void> {
   const rows = await env.DB.prepare(
     "SELECT id FROM campaigns WHERE status = 'active'"
   ).all<{ id: number }>();
+  let attempted = 0;
+  let succeeded = 0;
+  let skipped = 0;
   for (const row of rows.results) {
-    await createWithdrawal(env, row.id);
+    try {
+      const result = await createWithdrawal(env, row.id);
+      attempted++;
+      if (result > 0) succeeded++;
+      else skipped++;
+    } catch (e) {
+      console.error(`auto-disburse: campaign ${row.id} failed:`, e);
+    }
   }
-  console.log(`auto-disburse: checked ${rows.results.length} active campaigns`);
+  console.log(`auto-disburse: checked ${rows.results.length} campaigns, attempted ${attempted}, succeeded ${succeeded}, skipped ${skipped}`);
 }
 
 const appObject = Sentry.withSentry(
@@ -3794,7 +4432,13 @@ const appObject = Sentry.withSentry(
   }),
   {
     fetch: app.fetch,
-    scheduled: async (_: ScheduledController, env: Bindings, ctx: ExecutionContext) => {
+    scheduled: async (controller: ScheduledController, env: Bindings, ctx: ExecutionContext) => {
+      // 15-minute cron: intruder alert scan only.
+      if (controller.cron === "*/15 * * * *") {
+        ctx.waitUntil(runIntruderAlerts(env));
+        return;
+      }
+      // Daily cron: all scheduled jobs.
       ctx.waitUntil(runFeeSweep(env));
       ctx.waitUntil(runPledgeReminders(env));
       ctx.waitUntil(runPromotionExpiry(env));
@@ -3804,5 +4448,325 @@ const appObject = Sentry.withSentry(
     },
   }
 );
+
+// ===================================================================
+// USSD SERVICE (Africa's Talking callback)
+// Requires: USSD code provisioned via Africa Talking dashboard + MNO approval
+// ===================================================================
+
+const ussdSessions = new Map<string, { step: string; data: Record<string, string> }>();
+
+app.post("/api/ussd/callback", async (c) => {
+  const sessionId = c.req.header("sessionId") || c.req.query("sessionId") || "";
+  const phone = c.req.header("phoneNumber") || c.req.query("phoneNumber") || "";
+  const serviceCode = c.req.header("serviceCode") || c.req.query("serviceCode") || "";
+  const text = c.req.header("text") || c.req.query("text") || "";
+
+  if (!sessionId || !phone) return c.text("END Invalid request");
+
+  const session = ussdSessions.get(sessionId) || { step: "main", data: {} };
+  let response = "";
+
+  if (text === "") {
+    // Main menu
+    response = "CON Welcome to Kingdom Sponsor\n1. Donate to a campaign\n2. Check balance\n3. My pledges\n4. Help";
+    session.step = "main";
+  } else if (session.step === "main") {
+    switch (text) {
+      case "1":
+        response = "CON Choose campaign:\n";
+        const rows = await c.env.DB.prepare(
+          "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC LIMIT 5"
+        ).all<{ id: number; title: string }>();
+        for (let i = 0; i < rows.results.length; i++) {
+          response += `${i + 1}. ${rows.results[i].title}\n`;
+        }
+        session.step = "select_campaign";
+        break;
+      case "2":
+        const userRow = await c.env.DB.prepare("SELECT id FROM users WHERE phone = ?").bind(phone).first<{ id: number }>();
+        if (userRow) {
+          const total = await donorTotalCents(c.env.DB, userRow.id);
+          response = `END Your total giving: ${formatKwacha(total)}`;
+        } else {
+          response = "END You are not registered. Sign up on the app.";
+        }
+        session.step = "done";
+        break;
+      case "3":
+        response = "END Pledges feature coming soon on USSD.";
+        session.step = "done";
+        break;
+      case "4":
+        response = "END Help: Dial this code to donate to fundraisers. Visit kingdom-sponsor.app for more.";
+        session.step = "done";
+        break;
+      default:
+        response = "END Invalid option";
+        session.step = "done";
+    }
+  } else if (session.step === "select_campaign") {
+    const choice = parseInt(text, 10);
+    if (choice >= 1) {
+      const rows = await c.env.DB.prepare(
+        "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC LIMIT 5"
+      ).all<{ id: number; title: string }>();
+      if (rows.results[choice - 1]) {
+        session.data.campaignId = String(rows.results[choice - 1].id);
+        response = "CON Enter amount (K):";
+        session.step = "enter_amount";
+      } else {
+        response = "END Invalid campaign";
+        session.step = "done";
+      }
+    }
+  } else if (session.step === "enter_amount") {
+    const kwacha = parseFloat(text);
+    if (kwacha >= 1) {
+      session.data.amountCents = String(Math.round(kwacha * 100));
+      response = `CON Donate K${kwacha} to campaign?\n1. Yes\n2. No`;
+      session.step = "confirm_donation";
+    } else {
+      response = "END Invalid amount. Minimum is K1.";
+      session.step = "done";
+    }
+  } else if (session.step === "confirm_donation") {
+    if (text === "1") {
+      response = "END Donation initiated. You will receive a payment prompt on your phone.";
+      session.step = "done";
+    } else {
+      response = "END Donation cancelled.";
+      session.step = "done";
+    }
+  } else {
+    response = "END Session expired. Please dial again.";
+    session.step = "done";
+  }
+
+  if (session.step === "done") {
+    ussdSessions.delete(sessionId);
+  } else {
+    ussdSessions.set(sessionId, session);
+  }
+
+  c.header("Content-Type", "text/plain");
+  return c.text(response);
+});
+
+// ===================================================================
+// APPROVED HOST BADGE SYSTEM
+// Admin-controlled subscription for verified hosts
+// ===================================================================
+
+// Get badge pricing (admin configurable)
+app.get("/api/host/badge-config", async (c) => {
+  const basePrice = await getSetting(c.env, "host_badge_base_price_cents");
+  const proPrice = await getSetting(c.env, "host_badge_pro_price_cents");
+  const annualPrice = await getSetting(c.env, "host_badge_annual_price_cents");
+  const enabled = await getSetting(c.env, "host_badge_enabled");
+  return c.json({
+    enabled: enabled === "true",
+    tiers: {
+      basic: { priceCents: Number(basePrice) || 5000, days: 30, label: "Basic Host" },
+      pro: { priceCents: Number(proPrice) || 15000, days: 30, label: "Pro Host" },
+      annual: { priceCents: Number(annualPrice) || 120000, days: 365, label: "Annual Pro" },
+    },
+  });
+});
+
+// Admin: update badge pricing
+app.put("/api/admin/host/badge-config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  if (body.basicPriceCents) await setSetting(c.env, "host_badge_base_price_cents", String(body.basicPriceCents));
+  if (body.proPriceCents) await setSetting(c.env, "host_badge_pro_price_cents", String(body.proPriceCents));
+  if (body.annualPriceCents) await setSetting(c.env, "host_badge_annual_price_cents", String(body.annualPriceCents));
+  if (body.enabled !== undefined) await setSetting(c.env, "host_badge_enabled", body.enabled ? "true" : "false");
+  return c.json({ ok: true });
+});
+
+// Get user's badge status
+app.get("/api/host/badge-status", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const badge = await c.env.DB.prepare(
+    "SELECT * FROM host_badges WHERE user_id = ? AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1"
+  ).bind(user.sub).first<Record<string, any>>();
+  return c.json({
+    hasActiveBadge: !!badge,
+    tier: badge?.tier || null,
+    expiresAt: badge?.expires_at || null,
+  });
+});
+
+// Subscribe to a badge tier
+app.post("/api/host/badge/subscribe", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const enabled = await getSetting(c.env, "host_badge_enabled");
+  if (enabled !== "true") return c.json({ error: "Badge program not yet active" }, 503);
+
+  const body = await c.req.json();
+  const tier = String(body.tier ?? "basic");
+
+  let priceCents: number;
+  let days: number;
+  switch (tier) {
+    case "pro":
+      priceCents = Number(await getSetting(c.env, "host_badge_pro_price_cents")) || 15000;
+      days = 30;
+      break;
+    case "annual":
+      priceCents = Number(await getSetting(c.env, "host_badge_annual_price_cents")) || 120000;
+      days = 365;
+      break;
+    default:
+      priceCents = Number(await getSetting(c.env, "host_badge_base_price_cents")) || 5000;
+      days = 30;
+  }
+
+  // Check if user already has active badge
+  const existing = await c.env.DB.prepare(
+    "SELECT id FROM host_badges WHERE user_id = ? AND expires_at > datetime('now') AND status = 'active'"
+  ).bind(user.sub).first();
+
+  if (existing) {
+    return c.json({ error: "You already have an active badge. Wait for it to expire before renewing." }, 400);
+  }
+
+  // In production, this would trigger a Lipila payment prompt.
+  // For now, we directly activate (admin can require manual payment verification).
+  await c.env.DB.prepare(
+    "INSERT INTO host_badges (user_id, tier, expires_at, amount_cents, status) VALUES (?, ?, datetime('now', '+' || ? || ' days'), ?, 'active')"
+  ).bind(user.sub, tier, String(days), priceCents).run();
+
+  // Notify user
+  await pushToUser(c.env, user.sub, "Badge Activated",
+    "Your Verified Host badge is now active! It will expire in $days days.",
+    { type: "badge_activated", tier })
+    .catch((e) => console.error("badge push failed:", e));
+
+  return c.json({ ok: true, message: "Badge activated!", tier, expiresInDays: days });
+});
+
+// ===================================================================
+// AIRTIME SYSTEM (Admin controlled - "Coming Soon" until enabled)
+// ===================================================================
+
+// Get airtime config (public - shows if enabled)
+app.get("/api/airtime/config", async (c) => {
+  const enabled = await getSetting(c.env, "airtime_enabled");
+  const markup = await getSetting(c.env, "airtime_markup_pct");
+  const minAmount = await getSetting(c.env, "airtime_min_amount_cents");
+  const maxAmount = await getSetting(c.env, "airtime_max_amount_cents");
+  return c.json({
+    enabled: enabled === "true",
+    markupPct: Number(markup) || 5,
+    minAmountCents: Number(minAmount) || 500,
+    maxAmountCents: Number(maxAmount) || 50000,
+  });
+});
+
+// Create airtime order
+app.post("/api/airtime/order", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const enabled = await getSetting(c.env, "airtime_enabled");
+  if (enabled !== "true") return c.json({ error: "Airtime service coming soon" }, 503);
+
+  const body = await c.req.json();
+  const phone = String(body.phone ?? "").trim();
+  const network = String(body.network ?? "").toLowerCase();
+  const amountCents = Math.round(Number(body.amountCents) || 0);
+
+  if (!phone || phone.length < 10) return c.json({ error: "Valid phone required" }, 400);
+  if (!["airtel", "mtn", "zamtel"].includes(network)) return c.json({ error: "Invalid network" }, 400);
+
+  const minAmount = Number(await getSetting(c.env, "airtime_min_amount_cents")) || 500;
+  const maxAmount = Number(await getSetting(c.env, "airtime_max_amount_cents")) || 50000;
+  if (amountCents < minAmount || amountCents > maxAmount) {
+    return c.json({ error: `Amount must be between K${minAmount / 100} and K${maxAmount / 100}` }, 400);
+  }
+
+  const markupPct = Number(await getSetting(c.env, "airtime_markup_pct")) || 5;
+  const costCents = Math.round(amountCents * (1 + markupPct / 100));
+
+  const r = await c.env.DB.prepare(
+    "INSERT INTO airtime_orders (user_id, phone, network, amount_cents, cost_cents, status) VALUES (?, ?, ?, ?, ?, 'pending')"
+  ).bind(user.sub, phone, network, amountCents, costCents).run();
+
+  return c.json({
+    ok: true,
+    orderId: r.meta?.last_row_id,
+    phone,
+    network,
+    amountCents,
+    costCents,
+    message: `Airtime order of K${(amountCents / 100).toLocaleString()} to ${phone} received.`,
+  });
+});
+
+// Admin: update airtime config
+app.put("/api/admin/airtime/config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  if (body.enabled !== undefined) await setSetting(c.env, "airtime_enabled", body.enabled ? "true" : "false");
+  if (body.markupPct) await setSetting(c.env, "airtime_markup_pct", String(body.markupPct));
+  if (body.minAmountCents) await setSetting(c.env, "airtime_min_amount_cents", String(body.minAmountCents));
+  if (body.maxAmountCents) await setSetting(c.env, "airtime_max_amount_cents", String(body.maxAmountCents));
+  return c.json({ ok: true });
+});
+
+// ===================================================================
+// CAMPAIGN IMAGE EDIT (Admin - update logo/image on existing campaign)
+// ===================================================================
+
+app.put("/api/admin/campaigns/:id/image", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const campaignId = Number(c.req.param("id"));
+  if (!campaignId) return c.json({ error: "Invalid campaign id" }, 400);
+
+  const body = await c.req.json();
+  const imageUrl = String(body.imageUrl ?? "").trim();
+  const logoUrl = body.logoUrl !== undefined ? String(body.logoUrl ?? "").trim() || null : undefined;
+
+  const campaign = await c.env.DB.prepare("SELECT id FROM campaigns WHERE id = ?").bind(campaignId).first();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+
+  if (imageUrl) {
+    await c.env.DB.prepare("UPDATE campaigns SET image_url = ? WHERE id = ?").bind(imageUrl, campaignId).run();
+  }
+  if (logoUrl !== undefined) {
+    await c.env.DB.prepare("UPDATE campaigns SET logo_url = ? WHERE id = ?").bind(logoUrl, campaignId).run();
+  }
+
+  return c.json({ ok: true, message: "Campaign image updated" });
+});
+
+// ===================================================================
+// REAL-TIME DISBURSEMENT - trigger via API (in addition to cron)
+// ===================================================================
+
+app.post("/api/admin/disburse-now", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json();
+  const campaignId = Number(body.campaignId) || 0;
+
+  if (campaignId) {
+    const result = await createWithdrawal(c.env, campaignId);
+    return c.json({ ok: true, campaignId, payoutCents: result });
+  }
+
+  await runAutoDisburse(c.env);
+  return c.json({ ok: true, message: "Auto-disburse triggered for all campaigns" });
+});
 
 export default appObject;

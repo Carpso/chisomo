@@ -31,6 +31,8 @@ export interface TokenPayload {
   sub: number; // user id
   phone: string;
   isHost: boolean;
+  username?: string;
+  notifications_enabled?: number;
   iat: number;
   exp: number;
 }

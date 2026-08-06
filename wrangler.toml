@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # Sweep accumulated donation platform fees to SETTLEMENT_PHONE daily at 02:00 UTC.
 [triggers]
-crons = ["0 2 * * *"]
+crons = ["0 2 * * *", "*/15 * * * *"]
 
 # DB. For remote deploy, replace database_id with the one from:
 #   npx wrangler d1 create kingdom-sponsor-db
@@ -31,6 +31,8 @@ bucket_name = "kingdom-sponsor-media"
 #   SETTLEMENT_PHONE  - number where Kingdom Sponsor's fee earnings are disbursed
 #   FIREBASE_CLIENT_EMAIL - Firebase service-account client email (FCM push)
 #   FIREBASE_PRIVATE_KEY  - Firebase service-account private key (FCM push)
+#   BITLY_ACCESS_TOKEN    - Bitly API token (masks the *.workers.dev host in
+#                           public share links until you own a custom domain)
 #
 # Vars (plain config, change freely). NOTE: in production, `wrangler secret put`
 # with the same name overrides a var - so these placeholders are dev-only defaults.
@@ -48,6 +50,8 @@ APP_URL = "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev"
 #   4. Change APP_URL below to your custom domain
 #   5. Run `npx wrangler deploy`
 #   6. All share links, deep links, and webhook callbacks will use the new domain automatically.
+#   7. Remove the BITLY_ACCESS_TOKEN secret once the custom domain is live
+#      (`npx wrangler secret delete BITLY_ACCESS_TOKEN`).
 PLATFORM_FEE_PCT = "1"          # your cut per donation (%), Kingdom Sponsor keeps 1% above the minimum
 PLATFORM_MIN_FEE_CENTS = "300"  # flat minimum platform fee per donation (K3)
 LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila MoMo collection fee (%) -> customer pays 3.5% total on MoMo

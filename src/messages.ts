@@ -33,10 +33,10 @@ export function payoutFailedSms(campaignTitle: string, amountCents: number): str
   return `We could not send your payout of ${kwacha(amountCents)} for "${campaignTitle}" right now. Don't worry — we'll retry automatically. Kingdom Sponsor`;
 }
 
-/** Monthly reminder for a recurring pledge. */
-export function pledgeReminderSms(campaignTitle: string, amountCents: number, campaignId?: number, baseUrl?: string): string {
-  const link = campaignId ? `Give here: ${campaignLink(campaignId, baseUrl)}` : "";
-  return `Friendly reminder: your monthly pledge of ${kwacha(amountCents)} to "${campaignTitle}" is due today. ${link} Kingdom Sponsor`;
+/** Monthly reminder for a recurring pledge. `link` is a ready-to-send
+ *  (possibly shortened) URL to the campaign's share page. */
+export function pledgeReminderSms(campaignTitle: string, amountCents: number, link?: string): string {
+  return `Friendly reminder: your monthly pledge of ${kwacha(amountCents)} to "${campaignTitle}" is due today. ${link ? `Give here: ${link}` : ""} Kingdom Sponsor`;
 }
 
 /** Sent to the host once a paid promotion slot goes live. */

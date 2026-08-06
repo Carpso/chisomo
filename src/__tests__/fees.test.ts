@@ -31,15 +31,15 @@ describe("loadFeeConfig", () => {
 });
 
 describe("donationFees", () => {
-  it("charges the flat K3 minimum on small donations", () => {
+  it("charges the flat K3 minimum + ZMW 0.24 on small donations", () => {
     const f = donationFees(1000, DEFAULT); // K10
-    expect(f.platformFeeCents).toBe(300);
+    expect(f.platformFeeCents).toBe(324); // 300 (K3 min) + 24 (ZMW 0.24)
     expect(f.lipilaFeeCents).toBe(25);
   });
 
-  it("charges 1% when the percentage exceeds the K3 minimum", () => {
+  it("charges 1% + ZMW 0.24 when the percentage exceeds the K3 minimum", () => {
     const f = donationFees(50000, DEFAULT); // K500 -> 1% = K5
-    expect(f.platformFeeCents).toBe(500);
+    expect(f.platformFeeCents).toBe(524); // 500 (1%) + 24
   });
 
   it("never lets the platform fee exceed the donation after Lipila's fee", () => {

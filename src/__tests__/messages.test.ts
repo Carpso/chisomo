@@ -47,13 +47,13 @@ describe("transaction messages", () => {
     expect(payoutSentSms("Back to school", 9500)).toContain("mobile money");
   });
 
-  it("pledgeReminderSms embeds the share link when a campaign id is given", () => {
-    const msg = pledgeReminderSms("Back to school", 5000, 7);
-    expect(msg).toContain("/share/7");
+  it("pledgeReminderSms embeds the share link when one is given", () => {
+    const msg = pledgeReminderSms("Back to school", 5000, "https://bit.ly/xyz");
+    expect(msg).toContain("https://bit.ly/xyz");
     expect(msg).toContain("K50");
   });
 
-  it("pledgeReminderSms omits the link without a campaign id", () => {
+  it("pledgeReminderSms omits the link without one", () => {
     expect(pledgeReminderSms("Back to school", 5000)).not.toContain("share/");
   });
 });
