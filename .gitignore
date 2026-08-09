@@ -3,3 +3,9 @@ node_modules/
 dist/
 *.log
 .dev.vars
+
+# Temp / one-off
+.tmp-check/
+sql/inspect_*.sql
+sql/backfill_*.sql
+mno_health.sql

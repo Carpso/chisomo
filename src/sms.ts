@@ -11,6 +11,7 @@ export interface SmsEnv {
 }
 
 const AT_MESSAGES_URL = "https://api.africastalking.com/version1/messaging";
+const AT_AIRTIME_URL = "https://api.africastalking.com/version1/airtime/send";
 
 /** Africa's Talking requires E.164, no leading 0. Assumes +260 Zambian numbers here. */
 export function safePhone(phone: string): string {
@@ -22,8 +23,48 @@ export async function sendOtpSms(env: SmsEnv, phone: string, code: string): Prom
   return sendSms(
     env,
     phone,
-    `Kingdom Sponsor verification code: ${code}. It expires in 5 minutes. Do not share it with anyone.`,
+    `KSPONSOR: Your Kingdom Sponsor verification code is ${code}. It expires in 5 minutes. Do not share it.`,
   );
+}
+
+/** Sends airtime to a Zambian number via Africa's Talking airtime API.
+ *  - ENV=production -> real AT API call (requires AT_API_KEY secret).
+ *  - other            -> logged only (no network, no billing during dev/sandbox).
+ *  Recipient numbers must be E.164 (e.g. +260977123456).
+ *  Returns the AT response body on success; throws on failure.
+ */
+export async function sendAirtime(
+  env: SmsEnv,
+  phone: string,
+  kwachaAmount: number,
+): Promise<Record<string, any>> {
+  if (env.ENV !== "production") {
+    console.log(`[AIRTIME ${phone}] ZMW ${kwachaAmount.toFixed(2)} (sandbox, no network call)`);
+    return { responses: [{ status: "Sent", phoneNumber: safePhone(phone), sandbox: true }] };
+  }
+  const recipients = JSON.stringify([
+    { phoneNumber: safePhone(phone), amount: `ZMW ${kwachaAmount.toFixed(2)}` },
+  ]);
+  const form = new URLSearchParams({ username: env.AT_USERNAME, recipients });
+  const res = await fetch(AT_AIRTIME_URL, {
+    method: "POST",
+    headers: {
+      Apikey: env.AT_API_KEY,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: form.toString(),
+  });
+  const body = await res.text().catch(() => "");
+  if (!res.ok) {
+    throw new Error(`Africa's Talking airtime failed (${res.status}): ${body || "empty body"}`);
+  }
+  const parsed = JSON.parse(body);
+  const first = parsed?.responses?.[0];
+  if (first && String(first.status).toLowerCase() !== "sent" && first.errorMessage) {
+    throw new Error(`Africa's Talking airtime error: ${first.errorMessage}`);
+  }
+  return parsed;
 }
 
 /** Sends a branded SMS via Africa's Talking.
@@ -59,15 +100,17 @@ export async function sendSms(env: SmsEnv, phone: string, message: string): Prom
   };
 
   try {
-    await send(env.AT_FROM);
+    // Approved sender ID for this account is "KSPONSOR". Use it for ALL SMS
+    // (OTP + notifications) so messages arrive branded and pass MNO filtering.
+    const sender = (env.AT_FROM && env.AT_FROM.trim()) ? env.AT_FROM.trim() : "KSPONSOR";
+    await send(sender);
   } catch (e) {
     // AT returns 400 with "Invalid senderId" until a sender ID is approved.
-    // Fall back to the account's default sender so OTPs keep flowing; when
-    // KSPONSOR gets approved, this fallback stops being used automatically.
-    if (env.AT_FROM && String(e).includes("(400)")) {
+    // Fall back to the account's default sender so OTPs keep flowing.
+    if (String(e).includes("(400)")) {
       console.error("[SMS] sender ID rejected, retrying without FROM:", String(e).slice(0, 200));
       await send(undefined);
-      console.warn("[SMS] delivered with default sender (KSPONSOR not approved yet)");
+      console.warn("[SMS] delivered with AT default sender (KSPONSOR rejected)");
       return;
     }
     throw e;

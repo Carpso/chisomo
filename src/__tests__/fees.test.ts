@@ -15,6 +15,9 @@ const DEFAULT: FeeConfig = {
   platformMinFeeCents: 300,
   lipilaCollectionPct: 2.5,
   lipilaDisbursementPct: 1.5,
+  cardPlatformPct: 2,
+  cardPlatformMinFeeCents: 500,
+  cardLipilaCollectionPct: 2.5,
 };
 
 describe("loadFeeConfig", () => {
@@ -49,12 +52,36 @@ describe("donationFees", () => {
   });
 });
 
+describe("donationFees (cards)", () => {
+  it("charges the flat K5 minimum + ZMW 0.24 on small card donations", () => {
+    const f = donationFees(1000, DEFAULT, "card"); // K10
+    expect(f.platformFeeCents).toBe(524); // 500 (K5 min) + 24 (ZMW 0.24)
+    expect(f.lipilaFeeCents).toBe(25); // 2.5% Lipila card collection fee
+  });
+
+  it("charges 2% + ZMW 0.24 when the percentage exceeds the K5 minimum", () => {
+    const f = donationFees(100000, DEFAULT, "card"); // K1000 -> 2% = K20
+    expect(f.platformFeeCents).toBe(2024); // 2000 (2%) + 24
+  });
+
+  it("momo donations still use K3 min / 1%", () => {
+    const f = donationFees(1000, DEFAULT, "momo");
+    expect(f.platformFeeCents).toBe(324);
+  });
+});
+
 describe("payoutAmountCents", () => {
-  it("deducts both disbursement fees", () => {
+  it("deducts both disbursement fees including the ZMW 0.24 fixed fee", () => {
     const available = 10000; // K100
     const payout = payoutAmountCents(available, DEFAULT);
     expect(payout).toBe(available - disbursementFeeCents(available, DEFAULT) - platformDisbursementFeeCents(available, DEFAULT));
-    expect(payout).toBe(10000 - 150 - 300); // 1.5% + K3 min
+    expect(payout).toBe(10000 - 150 - 324); // 1.5% + K3 min + ZMW 0.2400
+  });
+
+  it("applies the ZMW 0.24 fixed fee when the percentage exceeds the K3 minimum", () => {
+    const available = 100000; // K1000 -> 1% = K10
+    const fee = platformDisbursementFeeCents(available, DEFAULT);
+    expect(fee).toBe(1024); // 1000 (1%) + 24 (ZMW 0.24)
   });
 
   it("never goes negative", () => {
@@ -69,6 +96,9 @@ describe("feeConfigPublic", () => {
       momoPct: 2.5,
       totalPct: 3.5,
       disbursementPct: 1.5,
+      cardPct: 2,
+      cardMinFeeCents: 500,
+      cardLipilaPct: 2.5,
     });
   });
 });

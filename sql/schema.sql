@@ -74,6 +74,21 @@ CREATE TABLE IF NOT EXISTS otps (
 );
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otps(phone);
 
+CREATE TABLE IF NOT EXISTS lipila_logs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          TEXT NOT NULL,            -- collection | disbursement
+  reference_id  TEXT NOT NULL,
+  phone         TEXT,
+  amount_cents  INTEGER NOT NULL,
+  status        TEXT NOT NULL,            -- pending | success | failed | error
+  lipila_status TEXT,
+  message       TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lipila_logs_ref  ON lipila_logs(reference_id);
+CREATE INDEX IF NOT EXISTS idx_lipila_logs_kind ON lipila_logs(kind, created_at);
+
 CREATE TABLE IF NOT EXISTS app_settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL

@@ -4,9 +4,10 @@ compatibility_date = "2026-01-01"
 workers_dev = true
 compatibility_flags = ["nodejs_compat"]
 
-# Sweep accumulated donation platform fees to SETTLEMENT_PHONE daily at 02:00 UTC.
+# Sweep accumulated donation platform fees to SETTLEMENT_PHONE daily at 08:00 CAT
+# (Zambia / Central Africa Time = UTC+2), plus intruder-alert scan every 15 min.
 [triggers]
-crons = ["0 2 * * *", "*/15 * * * *"]
+crons = ["*/15 * * * *", "0 6 * * *"]
 
 # DB. For remote deploy, replace database_id with the one from:
 #   npx wrangler d1 create kingdom-sponsor-db
@@ -31,31 +32,35 @@ bucket_name = "kingdom-sponsor-media"
 #   SETTLEMENT_PHONE  - number where Kingdom Sponsor's fee earnings are disbursed
 #   FIREBASE_CLIENT_EMAIL - Firebase service-account client email (FCM push)
 #   FIREBASE_PRIVATE_KEY  - Firebase service-account private key (FCM push)
-#   BITLY_ACCESS_TOKEN    - Bitly API token (masks the *.workers.dev host in
-#                           public share links until you own a custom domain)
 #
 # Vars (plain config, change freely). NOTE: in production, `wrangler secret put`
 # with the same name overrides a var - so these placeholders are dev-only defaults.
 [vars]
 ENV = "production"              # SMS + OTP mode: "sandbox" shows debug code in API, "production" sends real AT SMS
 AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (not user-facing; used in the AT API call)
-AT_FROM = ""             # registered AT sender ID / shortcode for production SMS (empty = AT default)
+AT_FROM = "KSPONSOR"      # approved AT sender ID — used for ALL SMS (OTP + notifications)
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
 APP_URL = "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev"
-# When you buy a custom domain (e.g. kingdom-sponsor.app):
-#   1. Add the domain in Cloudflare DNS (A record → Workers)
-#   2. In the Cloudflare dashboard → Workers → your worker → Settings → Routes
-#      add a route like `kingdom-sponsor.app/*` → kingdom-sponsor-api
-#   3. Set workers_dev = false (removes the *.workers.dev route)
-#   4. Change APP_URL below to your custom domain
-#   5. Run `npx wrangler deploy`
-#   6. All share links, deep links, and webhook callbacks will use the new domain automatically.
-#   7. Remove the BITLY_ACCESS_TOKEN secret once the custom domain is live
-#      (`npx wrangler secret delete BITLY_ACCESS_TOKEN`).
+# CORS_ORIGINS - extra HTTPS origins allowed to call the API from a browser
+# (comma-separated, e.g. "https://kingdom-sponsor.app"). APP_URL is always
+# allowed. Mobile Flutter clients are not CORS-restricted.
+CORS_ORIGINS = ""
+# SHORT_BASE_URL - optional custom domain for short share links (e.g.
+# "https://share.kingdom-sponsor.app"). Leave unset to reuse APP_URL
+# (the workers.dev URL). Switching domains = change this var + deploy; every
+# link generated afterwards uses the new domain (existing stored links keep
+# working because /go/:code also resolves links created under the previous base).
+# To use your own branded domain (e.g. kingdom-sponsor.app), first buy the domain
+# and point it at the worker, then set:
+#   SHORT_BASE_URL = "https://share.kingdom-sponsor.app"
+# SHORT_BASE_URL = "https://share.kingdom-sponsor.app"
 PLATFORM_FEE_PCT = "1"          # your cut per donation (%), Kingdom Sponsor keeps 1% above the minimum
 PLATFORM_MIN_FEE_CENTS = "300"  # flat minimum platform fee per donation (K3)
 LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila MoMo collection fee (%) -> customer pays 3.5% total on MoMo
 LIPILA_DISBURSEMENT_FEE_PCT = "1.5" # Lipila MoMo disbursement fee (%), deducted at payout
+CARD_PLATFORM_FEE_PCT = "2"        # card platform fee (%) -> 2% + ZMW 0.24 per card donation
+CARD_PLATFORM_MIN_FEE_CENTS = "500" # card platform minimum fee (K5)
+CARD_LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila card collection fee (%), donor pays
 OTP_TTL_MINUTES = "5"
 PROMO_PRICE_CENTS = "15000"     # cost of a promoted (top-5) slot per purchase: K150
 PROMO_DAYS = "7"                # how long a promotion stays live

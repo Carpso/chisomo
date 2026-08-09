@@ -39,12 +39,24 @@ describe("transaction messages", () => {
     expect(msg).toContain("CON-7-1234");
   });
 
+  it("donationConfirmedSms embeds the share link when one is given", () => {
+    expect(donationConfirmedSms("Back to school", 5000, "CON-7-1234", "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
+  });
+
   it("donationReceivedSms shows the current available balance", () => {
     expect(donationReceivedSms("Back to school", 5000, 12300)).toContain("K123");
   });
 
+  it("donationReceivedSms embeds the share link when one is given", () => {
+    expect(donationReceivedSms("Back to school", 5000, 12300, "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
+  });
+
   it("payoutSentSms mentions mobile money", () => {
     expect(payoutSentSms("Back to school", 9500)).toContain("mobile money");
+  });
+
+  it("payoutSentSms embeds the share link when one is given", () => {
+    expect(payoutSentSms("Back to school", 9500, "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
   });
 
   it("pledgeReminderSms embeds the share link when one is given", () => {
@@ -62,6 +74,10 @@ describe("promotion messages", () => {
   it("promotionActiveSms states days and end date", () => {
     expect(promotionActiveSms("Back to school", 7, "2026-08-12")).toContain("7 days");
     expect(promotionActiveSms("Back to school", 7, "2026-08-12")).toContain("2026-08-12");
+  });
+
+  it("promotionActiveSms embeds the share link when one is given", () => {
+    expect(promotionActiveSms("Back to school", 7, "2026-08-12", "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
   });
 
   it("promotionRejectedSms points to support for a refund", () => {
@@ -86,6 +102,14 @@ describe("milestone + campaign-end messages", () => {
     const msg = campaignEndedSms("Back to school", 500000, 12);
     expect(msg).toContain("K5,000");
     expect(msg).toContain("12 supporters");
+  });
+
+  it("campaignEndedSms embeds the share link when one is given", () => {
+    expect(campaignEndedSms("Back to school", 500000, 12, "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
+  });
+
+  it("campaignEndedSms omits the link without one", () => {
+    expect(campaignEndedSms("Back to school", 500000, 12)).not.toContain("bit.ly");
   });
 });
 

@@ -1,4 +1,4 @@
-// Kingdom Sponsor API - neutral fundraising platform.
+﻿// Kingdom Sponsor API - neutral fundraising platform.
 // Stack: Cloudflare Worker + D1 + Lipila (payments) + Africa's Talking (OTP SMS).
 // Money is stored in ngwee (integer cents). 100 ngwee = K1.
 
@@ -6,25 +6,35 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import * as Sentry from "@sentry/cloudflare";
 import { signToken, verifyToken, sha256Hex, type TokenPayload } from "./jwt";
-import { createCollection, checkCollectionStatus, checkDisbursementStatus, createDisbursement, getWalletBalance, type LipilaEnv } from "./lipila";
-import { sendOtpSms, sendSms } from "./sms";
+import { createCollection, createCardCollection, checkCollectionStatus, checkDisbursementStatus, createDisbursement, getWalletBalance, logLipilaEvent, lipilaBase, type LipilaEnv } from "./lipila";
+import { sendOtpSms, sendSms, sendAirtime } from "./sms";
 import { loadFeeConfig, donationFees, payoutAmountCents, disbursementFeeCents, platformDisbursementFeeCents, feeConfigPublic, formatKwacha } from "./fees";
 import { generateUsername, ensureUser, donorTotalCents, donorVisibleCents, tierFor } from "./donors";
 import { sendPushNotification, sendMulticastPush } from "./firebase";
-import { shortenUrl } from "./shorten";
 import {
   donationConfirmedSms, donationReceivedSms, payoutSentSms, payoutFailedSms, pledgeReminderSms,
   promotionActiveSms, promotionRejectedSms, campaignDeletedSms, deleteRequestReceivedSms,
   deleteRequestRejectedSms, supportReplySms, supportReceivedSms, promotionRefundedSms,
-  promotionExpiredSms, milestoneSms, campaignEndedSms,
+  promotionExpiredSms, milestoneSms, campaignEndedSms, editRequestApprovedSms,
+  airtimeSentSms, airtimeDeliveredSms, airtimeFailedSms,
 } from "./messages";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { createShortLink, resolveShortLink, shortBaseUrl, shortCodeFor } from "./shorten";
+import { CAMPAIGN_CATEGORIES, isValidCategory } from "./categories";
+
+const CAMPAIGN_TYPES = [
+  "community", "ngo", "faith", "emergency", "medical", "sponsor",
+] as const;
+
+/** Valid KYC document types a host can submit for vetting. */
+const HOST_KYC_TYPES = ["nrc", "ngo_cert", "endorsement"] as const;
 
 type Bindings = LipilaEnv & SmsEnv2 & {
   DB: D1Database;
   MEDIA: R2Bucket;
   JWT_SECRET: string;
   APP_URL: string;
+  SHORT_BASE_URL?: string;
   PLATFORM_FEE_PCT?: string;
   PLATFORM_MIN_FEE_CENTS?: string;
   LIPILA_COLLECTION_FEE_PCT?: string;
@@ -35,12 +45,12 @@ type Bindings = LipilaEnv & SmsEnv2 & {
   SUPERADMIN_PHONES?: string;
   PROMO_PRICE_CENTS?: string;
   PROMO_DAYS?: string;
-  FIREBASE_CLIENT_EMAIL?: string;
-  FIREBASE_PRIVATE_KEY?: string;
-  SENTRY_DSN?: string;
-  BITLY_ACCESS_TOKEN?: string;
-  ALERT_FROM_EMAIL?: string;
-};
+   FIREBASE_CLIENT_EMAIL?: string;
+   FIREBASE_PRIVATE_KEY?: string;
+   SENTRY_DSN?: string;
+   ALERT_FROM_EMAIL?: string;
+   CORS_ORIGINS?: string;
+ };
 
 interface SmsEnv2 {
   AT_USERNAME: string;
@@ -50,7 +60,29 @@ interface SmsEnv2 {
 }
 
 const app = new Hono<{ Bindings: Bindings }>();
-app.use("*", cors());
+// CORS: restrict to known origins. The allowed list is built from APP_URL
+// plus the optional CORS_ORIGINS var (comma-separated extra origins, e.g.
+// "https://kingdom-sponsor.app"). This prevents arbitrary sites from reading
+// API responses. Credentials are allowed for the web dashboard.
+function corsOrigins(env: Bindings): string[] {
+  const extra = String(env.CORS_ORIGINS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  const list = [env.APP_URL, ...extra];
+  return [...new Set(list)];
+}
+app.use(
+  "*",
+  cors({
+    origin: (origin, c) => {
+      if (!origin) return "";
+      return corsOrigins(c.env).includes(origin) ? origin : "";
+    },
+    credentials: true,
+    maxAge: 86400,
+  })
+);
 
 // ---------- helpers ----------
 
@@ -59,6 +91,50 @@ function normalizePhone(raw: string): string {
   if (digits.startsWith("260")) return `+${digits}`;
   if (digits.startsWith("0")) return `+260${digits.slice(1)}`;
   return `+${digits}`;
+}
+
+/** Mask a phone number for public display: +260 97 * * * * 3 4 5 6. */
+function maskPhone(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length < 4) return "â€¢â€¢â€¢â€¢";
+  const last4 = digits.slice(-4);
+  const tail = last4.length >= 4 ? ` ${last4.slice(0, 2)} ${last4.slice(2)}` : "";
+  return `+260 â€¢â€¢ â€¢â€¢ â€¢â€¢${tail}`;
+}
+
+// Zambian mobile networks by leading digits (after +260, e.g. 0977...).
+// Zambian mobile networks by 3-digit prefix (e.g. "097"). Per ZICTA's
+// 2024 numbering-plan update the new 05X prefixes are live. Zed Mobile's
+// 078/058 ranges are reserved but not yet officially enabled, so we still
+// route them to Zed Mobile.
+const ZM_NETWORKS = [
+  { id: "airtel", prefixes: ["097", "077", "057"] },
+  { id: "mtn", prefixes: ["096", "076", "056"] },
+  { id: "zamtel", prefixes: ["095", "075", "055"] },
+  { id: "zedmobile", prefixes: ["098", "078", "058"] },
+] as const;
+
+/** Which Zambian network a phone number belongs to (or null if unknown). */
+function networkOf(phone: string): string | null {
+  const n = phone.replace(/\D/g, "").replace(/^260/, "");
+  const local = n.startsWith("0") ? n : `0${n}`;
+  for (const net of ZM_NETWORKS) {
+    if (net.prefixes.some((p) => local.startsWith(p))) return net.id;
+  }
+  return null;
+}
+
+/** Per-network SMS health: "ok" | "down" (admin-controlled). Defaults to ok. */
+async function networkStatus(env: Bindings, networkId: string): Promise<string> {
+  const v = await getSetting(env, `net_status_${networkId}`);
+  return v === "down" ? "down" : "ok";
+}
+
+/** True when the phone's own network cannot receive SMS right now. */
+async function phoneSmsDown(env: Bindings, phone: string): Promise<boolean> {
+  const net = networkOf(phone);
+  if (!net) return false;
+  return (await networkStatus(env, net)) === "down";
 }
 
 async function hostStatusOf(env: Bindings, userId: number): Promise<Record<string, any>> {
@@ -75,6 +151,35 @@ function isAdminPhone(env: Bindings, phone: string | undefined): boolean {
   return admins.includes(normalizePhone(phone));
 }
 
+/** Best-effort client IP from Cloudflare / forwarding headers. */
+function clientIp(c: any): string {
+  return (
+    c.req.header("CF-Connecting-IP") ??
+    c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() ??
+    "unknown"
+  );
+}
+
+/** Per-IP OTP throttle: max [limit] requests per [windowSec] seconds. */
+async function ipOtpAllowed(env: Bindings, ip: string, limit: number, windowSec: number): Promise<boolean> {
+  if (!ip || ip === "unknown") return true;
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM otp_attempts WHERE ip = ? AND kind = 'otp' AND created_at > datetime('now', ?)"
+  ).bind(ip, `-${windowSec} seconds`).first<{ n: number }>();
+  return (row?.n ?? 0) < limit;
+}
+
+/** Records an OTP/verify attempt for IP throttling + intruder analysis. */
+async function recordOtpAttempt(env: Bindings, ip: string, phone: string | null): Promise<void> {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO otp_attempts (ip, phone, kind) VALUES (?, ?, 'otp')"
+    ).bind(ip ?? "unknown", phone).run();
+  } catch (e) {
+    console.error("otp attempt record failed:", e);
+  }
+}
+
 function envPushConfigured(env: Bindings): boolean {
   return !!env.FIREBASE_CLIENT_EMAIL && !!env.FIREBASE_PRIVATE_KEY;
 }
@@ -83,20 +188,32 @@ function fbEnv(env: Bindings) {
   return { FIREBASE_CLIENT_EMAIL: env.FIREBASE_CLIENT_EMAIL!, FIREBASE_PRIVATE_KEY: env.FIREBASE_PRIVATE_KEY! };
 }
 
-/** Best-effort push to every device registered to a user (no-op when FCM isn't configured). */
-async function pushToUser(env: Bindings, userId: number | null, title: string, body: string, data?: Record<string, string>): Promise<void> {
-  if (!envPushConfigured(env) || !userId) return;
+/** Best-effort push to every device registered to a user (no-op when FCM isn't configured).
+ *  Returns how many sends succeeded; invalid tokens are dropped from the DB. */
+async function pushToUser(env: Bindings, userId: number | null, title: string, body: string, data?: Record<string, string>): Promise<number> {
+  if (!envPushConfigured(env) || !userId) return 0;
   const row = await env.DB.prepare(
     "SELECT notifications_enabled FROM users WHERE id = ?"
   ).bind(userId).first<{ notifications_enabled: number }>();
-  if (!row || row.notifications_enabled === 0) return;
+  if (!row || row.notifications_enabled === 0) return 0;
   const rows = await env.DB.prepare(
     "SELECT token FROM device_tokens WHERE user_id = ?"
   ).bind(userId).all<{ token: string }>();
   const tokens = rows.results.map((r) => r.token);
-  if (!tokens.length) return;
-  await sendMulticastPush(fbEnv(env), tokens, title, body, data)
-    .catch((e) => console.error("push failed:", e));
+  if (!tokens.length) return 0;
+  const result = await sendMulticastPush(fbEnv(env), tokens, title, body, data)
+    .catch((e) => { console.error("push failed:", e); return { success: 0, failure: tokens.length, failedTokens: tokens as string[] }; });
+  if (result.failedTokens.length) {
+    await pruneInvalidTokens(env, result.failedTokens);
+  }
+  return result.success;
+}
+
+/** Delete device tokens FCM no longer accepts so the push path stays clean. */
+async function pruneInvalidTokens(env: Bindings, tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    await env.DB.prepare("DELETE FROM device_tokens WHERE token = ?").bind(token).run().catch(() => {});
+  }
 }
 
 /** True when the user has at least one registered app device (push-reachable). */
@@ -131,8 +248,11 @@ async function pushAdmins(env: Bindings, title: string, body: string, data?: Rec
   ).bind(...phones).all<{ token: string }>();
   const tokens = rows.results.map((r) => r.token);
   if (!tokens.length) return;
-  await sendMulticastPush(fbEnv(env), tokens, title, body, data)
-    .catch((e) => console.error("admin push failed:", e));
+  const result = await sendMulticastPush(fbEnv(env), tokens, title, body, data)
+    .catch((e) => { console.error("admin push failed:", e); return { success: 0, failure: tokens.length, failedTokens: tokens as string[] }; });
+  if (result.failedTokens.length) {
+    await pruneInvalidTokens(env, result.failedTokens);
+  }
 }
 
 /** Push to every user whose phone is on the superadmin list (used for urgent admin alerts). */
@@ -143,10 +263,13 @@ async function pushAndSmsAdmins(env: Bindings, smsText: string, pushTitle: strin
   }
   if (envPushConfigured(env) && phones.length) {
     const placeholders = phones.map(() => "?").join(",");
-    const admins = await env.DB.prepare(
-      `SELECT fcm_token FROM users WHERE fcm_token IS NOT NULL AND phone IN (${placeholders})`
-    ).bind(...phones).all<{ fcm_token: string }>();
-    const tokens = admins.results.map((a) => a.fcm_token);
+    // Use device_tokens table (multi-device) instead of legacy users.fcm_token
+    const rows = await env.DB.prepare(
+      `SELECT DISTINCT dt.token FROM device_tokens dt
+       JOIN users u ON u.id = dt.user_id
+       WHERE u.phone IN (${placeholders})`
+    ).bind(...phones).all<{ token: string }>();
+    const tokens = rows.results.map((r) => r.token);
     if (tokens.length) {
       await sendMulticastPush(fbEnv(env), tokens, pushTitle, pushBody, { type: "admin_alert" })
         .catch((e) => console.error("admin push failed:", e));
@@ -180,18 +303,18 @@ function buildIntruderAlertText(rows: FailedLoginRow[]): string {
   const when = rows[0]?.created_at ? ` (${rows[0].created_at})` : "";
   const details = rows
     .map((r) => {
-      const ua = r.user_agent ? ` · ${r.user_agent.slice(0, 80)}` : "";
-      return `• ${r.created_at ?? "?"} — ${r.phone} — ${intruderReasonLabel(r.reason)} — IP ${r.ip ?? "?"}${ua}`;
+      const ua = r.user_agent ? ` Â· ${r.user_agent.slice(0, 80)}` : "";
+      return `â€¢ ${r.created_at ?? "?"} â€” ${r.phone} â€” ${intruderReasonLabel(r.reason)} â€” IP ${r.ip ?? "?"}${ua}`;
     })
     .join("\n");
   return [
-    `🚨 SECURITY ALERT — ${n} failed login attempt${n === 1 ? "" : "s"} on Kingdom Sponsor${when}`,
+    `ðŸš¨ SECURITY ALERT â€” ${n} failed login attempt${n === 1 ? "" : "s"} on Kingdom Sponsor${when}`,
     ``,
     `Someone tried (and failed) to sign in with these numbers. If this was not you, your number may be under attack.`,
     ``,
     details,
     ``,
-    `If this was not you, secure your number and contact support immediately. — Kingdom Sponsor`,
+    `If this was not you, secure your number and contact support immediately. â€” Kingdom Sponsor`,
   ].join("\n");
 }
 
@@ -255,7 +378,7 @@ async function notifyIntruderAlert(
   }
 
   // Short SMS + in-app push to superadmins (SMS must stay brief for one part).
-  const short = `⚠️ Kingdom Sponsor: ${rows.length} failed login attempt${rows.length === 1 ? "" : "s"} (${rows
+  const short = `KSPONSOR ALERT: ${rows.length} failed login attempt${rows.length === 1 ? "" : "s"} (${rows
     .map((r) => r.phone)
     .join(", ")}). Check the admin panel.`;
   await pushAndSmsAdmins(env, short, "Intruder alert", text);
@@ -344,16 +467,29 @@ async function ensureReferralCode(env: Bindings, userId: number): Promise<string
   return code;
 }
 
-/** Attach a new signup to their referrer (only when the referrer is a different real user). */
-async function attachReferral(env: Bindings, newUserId: number, rawCode?: string): Promise<void> {
+/** Attach a user to their referrer (only when the referrer is a different real user).
+ *  Works for both new signups and pre-existing accounts that never linked before;
+ *  a user can only ever be linked to one referrer (unique index on referred_user_id). */
+async function attachReferral(env: Bindings, userId: number, rawCode?: string): Promise<void> {
   const code = String(rawCode ?? "").trim().toUpperCase();
   if (code.length < 4) return;
   const referrer = await env.DB.prepare("SELECT id FROM users WHERE referral_code = ?")
     .bind(code).first<{ id: number }>();
-  if (!referrer || referrer.id === newUserId) return;
+  if (!referrer || referrer.id === userId) return;
+  const already = await env.DB.prepare("SELECT 1 FROM referrals WHERE referred_user_id = ?")
+    .bind(userId).first();
+  if (already) return;
   await env.DB.prepare(
     "INSERT OR IGNORE INTO referrals (referrer_user_id, referred_user_id) VALUES (?, ?)"
-  ).bind(referrer.id, newUserId).run();
+  ).bind(referrer.id, userId).run();
+}
+
+/** Referral reward threshold (admin_settings, default 5 signups). */
+async function referralRewardThreshold(env: Bindings): Promise<number> {
+  const row = await env.DB.prepare("SELECT value FROM admin_settings WHERE key = 'referral_reward_threshold'")
+    .first<{ value: string }>();
+  const n = Math.round(Number(row?.value ?? 0));
+  return Number.isFinite(n) && n > 0 ? n : 5;
 }
 
 /** Confirm a contribution (webhook or polling) and credit the campaign. */
@@ -363,27 +499,32 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
   ).bind(referenceId).first<Record<string, any>>();
   if (!row || row.status === "confirmed") return;
 
+  // Idempotency: only the call that flips pending -> confirmed proceeds, so a
+  // webhook replay or a concurrent status poll can't double-notify or double-
+  // trigger the auto-disburse path.
+  const confirmRes = await env.DB.prepare(
+    "UPDATE contributions SET status = 'confirmed', confirmed_at = datetime('now', '+2 hours') WHERE id = ? AND status = 'pending'"
+  ).bind(row.id).run();
+  if ((confirmRes.meta?.changes ?? 0) === 0) return;
+
   const raisedBefore = (await env.DB.prepare(
     "SELECT COALESCE(SUM(amount_cents),0) AS s FROM contributions WHERE campaign_id = ? AND status = 'confirmed'"
   ).bind(row.campaign_id).first<{ s: number }>())?.s ?? 0;
-
-  await env.DB.prepare(
-    "UPDATE contributions SET status = 'confirmed', confirmed_at = datetime('now', '+2 hours') WHERE id = ?"
-  ).bind(row.id).run();
 
   const campaign = await env.DB.prepare(
     "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(row.campaign_id).first<Record<string, any>>();
   const available = await availableBalance(env, row.campaign_id);
+  const shareLink = campaign ? await createShortLink(env, `${env.APP_URL}/share/${campaign.id}`) : undefined;
   if (campaign?.host_phone) {
-    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, donationReceivedSms(campaign.title, row.amount_cents, available));
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, donationReceivedSms(campaign.title, row.amount_cents, available, shareLink));
     await pushToUser(env, campaign.host_user_id, "New gift received",
       `Someone gave ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign.title}".`,
       { type: "donation_received", campaignId: String(campaign.id) })
       .catch((e) => console.error("host push failed:", e));
   }
   if (row.phone) {
-    await smsIfNoPush(env, row.donor_user_id, row.phone, donationConfirmedSms(campaign?.title ?? "campaign", row.amount_cents, referenceId));
+    await smsIfNoPush(env, row.donor_user_id, row.phone, donationConfirmedSms(campaign?.title ?? "campaign", row.amount_cents, referenceId, shareLink));
     await pushToUser(env, row.donor_user_id, "Gift confirmed",
       `Thank you! Your gift of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign?.title ?? "campaign"}" is confirmed.`,
       { type: "donation_confirmed", campaignId: String(campaign?.id ?? ""), contributionId: String(row.id) })
@@ -404,6 +545,11 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
       }
     }
   }
+
+  // Alert the superadmin(s) about every confirmed donation.
+  await pushAdmins(env, "New donation",
+    `${(row.amount_cents / 100).toLocaleString()} ZMW given to "${campaign?.title ?? "campaign"}".`,
+    { type: "donation", campaignId: String(campaign?.id ?? "") }).catch(() => {});
 
   // Milestone notifications: alert a campaign's donors when it crosses 25/50/75/100% of its goal.
   await maybeNotifyMilestones(env, campaign, raisedBefore, row.amount_cents);
@@ -446,7 +592,7 @@ async function maybeNotifyMilestones(env: Bindings, campaign: Record<string, any
   await pushToUser(env, campaign.host_user_id, title, body, { type: "milestone", campaignId: String(campaign.id) })
     .catch(() => {});
   if (pct === 100 && campaign.host_phone) {
-    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, `🎉 ${campaign.title} has reached its goal of ${(campaign.goal_cents / 100).toLocaleString()} ZMW!`);
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, `ðŸŽ‰ ${campaign.title} has reached its goal of ${(campaign.goal_cents / 100).toLocaleString()} ZMW!`);
   }
 }
 
@@ -464,7 +610,7 @@ async function maybeAutoDisburse(env: Bindings, campaignId: number): Promise<voi
  * already-withdrawn amounts, withdrawal disbursement fees, and the
  * platform's payout cut taken at withdrawal time.
  * NOTE: per-donation platform fees (platformFeeCents) and Lipila
- * collection fees (lipilaFeeCents) are NOT subtracted here — they are
+ * collection fees (lipilaFeeCents) are NOT subtracted here â€” they are
  * already paid by the donor on top of their gift amount.
  */
 async function availableBalance(env: Bindings, campaignId: number): Promise<number> {
@@ -490,6 +636,23 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
   const available = await availableBalance(env, campaignId);
   if (available < campaign.min_withdraw_cents) return 0; // honour the host's set payout minimum
 
+  // Idempotency: never start a second payout while one is still in flight
+  // (guards host double-taps, cron overlap, and network retries).
+  const inFlight = (await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','processing')"
+  ).bind(campaignId).first<{ n: number }>())?.n ?? 0;
+  if (inFlight > 0) return 0;
+
+  // Back-off: don't retry within 30 minutes of the last failed attempt.
+  // Changed from 24h to allow faster retries when API issues are resolved.
+  const lastFailed = (await env.DB.prepare(
+    "SELECT created_at FROM withdrawals WHERE campaign_id = ? AND status = 'failed' ORDER BY created_at DESC LIMIT 1"
+  ).bind(campaignId).first<{ created_at: string }>())?.created_at;
+  if (lastFailed) {
+    const elapsed = Date.now() - new Date(lastFailed + "Z").getTime();
+    if (elapsed < 30 * 60 * 1000) return 0; // skip if last failure < 30 minutes ago
+  }
+
   const payoutCents = payoutAmountCents(available, cfg);
   const lipilaFee = disbursementFeeCents(available, cfg);
   const platformFee = platformDisbursementFeeCents(available, cfg);
@@ -497,9 +660,15 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
 
   const referenceId = `PAY-${campaignId}-${Date.now()}`;
   try {
-    await env.DB.prepare(
-      "INSERT INTO withdrawals (campaign_id, amount_cents, disbursement_fee_cents, platform_fee_cents, lipila_reference, status) VALUES (?, ?, ?, ?, ?, 'pending')"
-    ).bind(campaignId, payoutCents, lipilaFee, platformFee, referenceId).run();
+    // Atomic idempotency: insert only when no pending/processing payout exists
+    // for this campaign, so concurrent triggers (cron + webhook + admin + the
+    // per-donation maybeAutoDisburse) can never start a second payout.
+    const inserted = await env.DB.prepare(
+      "INSERT INTO withdrawals (campaign_id, amount_cents, disbursement_fee_cents, platform_fee_cents, lipila_reference, status) " +
+      "SELECT ?, ?, ?, ?, ?, 'pending' " +
+      "WHERE NOT EXISTS (SELECT 1 FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','processing'))"
+    ).bind(campaignId, payoutCents, lipilaFee, platformFee, referenceId, campaignId).run();
+    if ((inserted.meta?.changes ?? 0) === 0) return 0; // another payout already in flight
 
     const result = await createDisbursement(env, {
       referenceId,
@@ -507,19 +676,26 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
       accountNumber: campaign.host_phone.replace("+", ""),
       narration: `Kingdom Sponsor payout: ${campaign.title}`,
       callbackUrl: `${env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(env.LIPILA_WEBHOOK_SECRET)}`,
-    });
+    }, env.DB);
 
     await env.DB.prepare(
       "UPDATE withdrawals SET lipila_identifier = ? WHERE lipila_reference = ?"
     ).bind(result.identifier, referenceId).run();
     return payoutCents;
   } catch (e) {
+    const reason = (e instanceof Error ? e.message : String(e)).slice(0, 500);
     await env.DB.prepare(
-      "UPDATE withdrawals SET status = 'failed' WHERE lipila_reference = ?"
-    ).bind(referenceId).run();
+      "UPDATE withdrawals SET status = 'failed', error = ? WHERE lipila_reference = ?"
+    ).bind(reason, referenceId).run();
+    // Log failed attempt to lipila_logs for admin visibility
+    await logLipilaEvent(env.DB, "disbursement", referenceId, campaign.host_phone, payoutCents, {
+      status: "failed",
+      message: reason,
+    });
     console.error("disbursement failed:", e);
     if (campaign.host_phone) {
-      await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, payoutFailedSms(campaign.title, payoutCents));
+      const failedShareLink = await createShortLink(env, `${env.APP_URL}/share/${campaign.id}`);
+      await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, payoutFailedSms(campaign.title, payoutCents, failedShareLink));
       await pushToUser(env, campaign.host_user_id, "Payout delayed",
         `We'll retry your payout of ${(payoutCents / 100).toLocaleString()} ZMW for "${campaign.title}" automatically.`,
         { type: "payout_failed", campaignId: String(campaign.id) })
@@ -549,11 +725,13 @@ async function settlePlatformFees(
       accountNumber: phone.replace("+", ""),
       narration: "Kingdom Sponsor platform fee settlement",
       callbackUrl: `${env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(env.LIPILA_WEBHOOK_SECRET)}`,
-    });
+    }, env.DB);
   } catch (e) {
     await env.DB.prepare(
       "UPDATE fee_sweeps SET status = 'failed' WHERE lipila_reference = ?"
     ).bind(ref).run();
+    const msg = e instanceof Error ? e.message : String(e);
+    await logLipilaEvent(env.DB, "disbursement", ref, phone, amountCents, msg);
     console.error("fee settlement failed:", e);
   }
 }
@@ -574,7 +752,9 @@ async function pendingDonationFees(env: Bindings): Promise<number> {
     "SELECT COALESCE(SUM(platform_fee_cents),0) AS s FROM withdrawals WHERE status = 'success'"
   ).first<{ s: number }>())?.s ?? 0;
   const settled = (await env.DB.prepare(
-    "SELECT COALESCE(SUM(amount_cents),0) AS s FROM fee_sweeps WHERE status = 'success'"
+    // Count both confirmed and committed-in-flight sweeps so a missed webhook
+    // (row stuck 'pending') can never cause the same fees to be swept twice.
+    "SELECT COALESCE(SUM(amount_cents),0) AS s FROM fee_sweeps WHERE status IN ('success','pending')"
   ).first<{ s: number }>())?.s ?? 0;
   return earnedDonations + earnedPayouts - settled;
 }
@@ -608,6 +788,11 @@ async function setSetting(env: Bindings, key: string, value: string): Promise<vo
   await env.DB.prepare(
     "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
   ).bind(key, value).run();
+}
+
+/** Display name of the support assistant used as signature/greeting in replies. */
+async function supportAssistantName(env: Bindings): Promise<string> {
+  return (await getSetting(env, "support_assistant_name")) ?? "Kingdom Sponsor Care Team";
 }
 
 /** Promotion price/days are set by the superadmin in the app (stored in app_settings, env as fallback). */
@@ -657,7 +842,7 @@ async function confirmPromotion(env: Bindings, referenceId: string): Promise<voi
     await sendSms(
       env,
       campaign.host_phone,
-      `Kingdom Sponsor: your K${(promo.amount_cents / 100).toLocaleString()} promotion payment for "${campaign.title}" was received and is pending approval. You'll be notified once it goes live.`
+      `Kingdom Sponsor â€” Promotion Payment Received\n\nYour payment of K${(promo.amount_cents / 100).toLocaleString()} for "${campaign.title}" has been received and is pending admin approval. You will be notified once the promotion goes live.`
     ).catch((e) => console.error("promo pending sms failed:", e));
   }
 }
@@ -684,7 +869,8 @@ async function approvePromotion(env: Bindings, promoId: number): Promise<void> {
     "SELECT c.title, c.id, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(promo.campaign_id).first<Record<string, any>>();
   if (campaign?.host_phone) {
-    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, promotionActiveSms(campaign.title, days, until.slice(0, 10)));
+    const promoShareLink = await createShortLink(env, `${env.APP_URL}/share/${campaign.id}`);
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, promotionActiveSms(campaign.title, days, until.slice(0, 10), promoShareLink));
     await pushToUser(env, campaign.host_user_id, "Your campaign is promoted",
       `"${campaign.title}" is now at the top of Kingdom Sponsor for ${days} days.`,
       { type: "promotion_active", campaignId: String(campaign.id) })
@@ -741,7 +927,7 @@ async function refundPromotion(env: Bindings, promoId: number): Promise<void> {
     accountNumber: campaign.host_phone.replace("+", ""),
     narration: `Kingdom Sponsor promotion refund for ${campaign.title}`,
     callbackUrl: `${env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(env.LIPILA_WEBHOOK_SECRET)}`,
-  });
+  }, env.DB);
   await env.DB.prepare(
     "UPDATE refunds SET lipila_identifier = ? WHERE lipila_reference = ?"
   ).bind(result.identifier, referenceId).run();
@@ -813,7 +999,7 @@ async function runTicketAutoClose(env: Bindings): Promise<void> {
       "UPDATE support_tickets SET status = 'closed', closed_at = datetime('now', '+2 hours'), admin_reply = CASE WHEN admin_reply IS NULL THEN ? ELSE admin_reply || char(10) || ? END WHERE id = ? AND status = 'open'"
     ).bind(note, note, row.id).run();
     if (row.phone) {
-      await smsIfNoPush(env, row.user_id, row.phone, `Your support request #${row.id} ("${row.subject}") was closed after 7 days without a reply. Open it again in the app if you still need help. Kingdom Sponsor`);
+      await smsIfNoPush(env, row.user_id, row.phone, `Kingdom Sponsor\n\nYour support request #${row.id} ("${row.subject}") was closed after 7 days without a reply. You can reopen it anytime in the app if you still need assistance.`);
       await pushToUser(env, row.user_id, "Support request closed",
         `Your request "${row.subject}" was closed after 7 days without a reply. Open it again if you still need help.`,
         { type: "ticket_closed", ticketId: String(row.id) })
@@ -823,6 +1009,30 @@ async function runTicketAutoClose(env: Bindings): Promise<void> {
 }
 
 // ---------- recurring pledges (monthly reminders) ----------
+
+/** Daily: alert donors when a campaign they supported ends within 48h. */
+async function runCampaignEndingAlerts(env: Bindings): Promise<void> {
+  if (!envPushConfigured(env)) return;
+  const in48h = new Date(Date.now() + 48 * 3600000).toISOString().slice(0, 10);
+  const campaigns = await env.DB.prepare(
+    `SELECT c.id, c.title, c.ends_at FROM campaigns c
+     WHERE c.status = 'active' AND c.visibility = 'public'
+       AND c.ends_at IS NOT NULL AND c.ends_at <= ? AND c.ends_at >= date('now')`
+  ).bind(in48h).all<{ id: number; title: string; ends_at: string }>();
+  for (const c of campaigns.results) {
+    const donors = await env.DB.prepare(
+      `SELECT DISTINCT dt.token FROM device_tokens dt
+       JOIN contributions co ON co.donor_user_id = dt.user_id
+       WHERE co.campaign_id = ? AND co.status = 'confirmed'`
+    ).bind(c.id).all<{ token: string }>();
+    if (!donors.results.length) continue;
+    await sendMulticastPush(fbEnv(env), donors.results.map((d) => d.token),
+      `"${c.title}" ends soon`,
+      `This campaign closes ${new Date(c.ends_at + "T23:59:59Z").toLocaleDateString()}. Give now to make a difference.`,
+      { type: "campaign_ending", campaignId: String(c.id) })
+      .catch((e) => console.error("campaign-ending push failed:", e));
+  }
+}
 
 /** Daily cron: SMS a reminder to donors whose pledge day is today (Zambia time, UTC+2). */
 async function runPledgeReminders(env: Bindings): Promise<void> {
@@ -842,9 +1052,14 @@ async function runPledgeReminders(env: Bindings): Promise<void> {
   ).bind(today, daysInMonth).all<Record<string, any>>();
 
   for (const row of rows.results) {
-    const shortLink = await shortenUrl(env, `${env.APP_URL}/share/${row.campaign_id}`);
-    const message = pledgeReminderSms(row.campaign_title, row.amount_cents, shortLink);
-    await smsIfNoPush(env, row.user_id, row.phone, message);
+    // Deep link opens the app straight to the campaign; SMS shows the link
+    // text so people without the app can still tap through to the web page.
+    const deepLink = `kingdomsponsor://campaign/${row.campaign_id}`;
+    const shareLink = await createShortLink(env, `${env.APP_URL}/share/${row.campaign_id}`);
+    const message = pledgeReminderSms(row.campaign_title, row.amount_cents, deepLink, shareLink);
+    // Pledge reminders are SMS-first: always send, even to app users (a push
+    // may go unnoticed; the pledge reminder SMS is the point of the feature).
+    await sendSms(env, row.phone, message).catch((e) => console.error("pledge reminder sms failed:", e));
 
     // Push notification
     await pushToUser(env, row.user_id, "Monthly pledge due",
@@ -862,17 +1077,22 @@ async function confirmWithdrawal(env: Bindings, referenceId: string): Promise<vo
     "SELECT * FROM withdrawals WHERE lipila_reference = ?"
   ).bind(referenceId).first<Record<string, any>>();
   if (!row) return;
-  await env.DB.prepare(
-    "UPDATE withdrawals SET status = 'success' WHERE id = ?"
+  // Idempotency: only the call that flips pending -> success proceeds. A webhook
+  // replay or the cron (runWithdrawalStatusChecks) racing the webhook must not
+  // settle the platform fee a second time.
+  const res = await env.DB.prepare(
+    "UPDATE withdrawals SET status = 'success' WHERE id = ? AND status = 'pending'"
   ).bind(row.id).run();
+  if ((res.meta?.changes ?? 0) === 0) return;
   if ((row.platform_fee_cents ?? 0) > 0) {
     await settlePlatformFees(env, referenceId, row.platform_fee_cents);
   }
   const campaign = await env.DB.prepare(
     "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(row.campaign_id).first<Record<string, any>>();
-  if (campaign?.host_phone) {
-    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, payoutSentSms(campaign.title, row.amount_cents));
+   if (campaign?.host_phone) {
+    const shareLink = await createShortLink(env, `${env.APP_URL}/share/${campaign.id}`);
+    await smsIfNoPush(env, campaign.host_user_id, campaign.host_phone, payoutSentSms(campaign.title, row.amount_cents, shareLink));
     await pushToUser(env, campaign.host_user_id, "Payout sent",
       `Your payout of ${(row.amount_cents / 100).toLocaleString()} ZMW for "${campaign.title}" is on its way to your mobile money.`,
       { type: "payout_sent", campaignId: String(campaign.id) })
@@ -892,10 +1112,15 @@ async function runWithdrawalStatusChecks(env: Bindings): Promise<void> {
       if (s.includes("success") || s.includes("complete")) {
         await confirmWithdrawal(env, row.lipila_reference);
       } else if (s.includes("fail") || s.includes("cancel") || s.includes("reject")) {
-        await env.DB.prepare("UPDATE withdrawals SET status = 'failed' WHERE id = ? AND status = 'pending'")
-          .bind(row.id).run();
+        const reason = (status.message ?? `Lipila reported status: ${status.status}`).slice(0, 500);
+        await env.DB.prepare("UPDATE withdrawals SET status = 'failed', error = ? WHERE id = ? AND status = 'pending'")
+          .bind(reason, row.id).run();
       }
     } catch (e) {
+      // Check itself failed (network/API) â€” leave pending for retry, but record the last error.
+      const reason = (e instanceof Error ? e.message : String(e)).slice(0, 500);
+      await env.DB.prepare("UPDATE withdrawals SET error = ? WHERE id = ? AND status = 'pending'")
+        .bind(reason, row.id).run();
       console.error("withdrawal status check failed:", row.lipila_reference, e);
     }
   }
@@ -907,6 +1132,29 @@ async function failContribution(env: Bindings, referenceId: string): Promise<voi
   ).bind(referenceId).run();
 }
 
+/** Scheduled: re-check pending fee sweeps (platform-fee settlements and manual
+ *  admin withdrawals) with Lipila in case a webhook was missed. Without this a
+ *  stuck 'pending' sweep would linger and inflate the "settled" ledger. */
+async function runFeeSweepStatusChecks(env: Bindings): Promise<void> {
+  const rows = await env.DB.prepare(
+    "SELECT id, lipila_reference FROM fee_sweeps WHERE status = 'pending' AND lipila_reference IS NOT NULL ORDER BY created_at ASC LIMIT 50"
+  ).all<{ id: number; lipila_reference: string }>();
+  for (const row of rows.results) {
+    try {
+      const status = await checkDisbursementStatus(env, row.lipila_reference);
+      const s = String(status.status ?? "").toLowerCase();
+      if (s.includes("success") || s.includes("complete")) {
+        await env.DB.prepare("UPDATE fee_sweeps SET status = 'success' WHERE id = ? AND status = 'pending'").bind(row.id).run();
+      } else if (s.includes("fail") || s.includes("cancel") || s.includes("reject")) {
+        await env.DB.prepare("UPDATE fee_sweeps SET status = 'failed' WHERE id = ? AND status = 'pending'").bind(row.id).run();
+      }
+    } catch (e) {
+      // Check failed (network/API) â€” leave pending for the next run.
+      console.error("fee sweep status check failed:", row.lipila_reference, e);
+    }
+  }
+}
+
 // ---------- auth ----------
 
 app.post("/api/auth/request-otp", async (c) => {
@@ -916,13 +1164,32 @@ app.post("/api/auth/request-otp", async (c) => {
     return c.json({ error: "Enter a valid Zambian phone number (e.g. 0977123456)" }, 400);
   }
 
+  // Don't pay for SMS that cannot be delivered: if the user's own network is
+  // marked down by the admin, tell them instead of sending the code.
+  if (c.env.ENV === "production") {
+    const net = networkOf(phone);
+    if (net && (await networkStatus(c.env, net)) === "down") {
+      const label = net === "zedmobile" ? "ZedMobile" : `${net[0].toUpperCase()}${net.slice(1)}`;
+      return c.json({ error: `${label} SMS service is temporarily unavailable. Please try again shortly.` }, 503);
+    }
+  }
+
   const nowSec = Math.floor(Date.now() / 1000);
+  const ip = clientIp(c);
+
+  // Per-IP throttle (SMS-bomb protection): max 10 OTPs per IP per 10 minutes.
+  if (!(await ipOtpAllowed(c.env, ip, 10, 600))) {
+    await recordOtpAttempt(c.env, ip, phone);
+    return c.json({ error: "Too many requests from this device. Try again later." }, 429);
+  }
+
   const recent = (await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM otps WHERE phone = ? AND sent_at > ?"
   ).bind(phone, nowSec - 3600).first<{ n: number }>()) ?? { n: 0 };
   if (recent.n >= 5) {
     return c.json({ error: "Too many codes. Try again in an hour." }, 429);
   }
+  await recordOtpAttempt(c.env, ip, phone);
 
   const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 900000 + 100000);
   const codeHash = await sha256Hex(code);
@@ -1003,7 +1270,7 @@ app.post("/api/auth/verify-otp", async (c) => {
     user.username = username;
   }
   await ensureReferralCode(c.env, user.id);
-  if (isNewUser) {
+  if (referralCode) {
     await attachReferral(c.env, user.id, referralCode);
   }
 
@@ -1062,7 +1329,30 @@ app.put("/api/admin/sms-status", async (c) => {
   return c.json({ ok: true });
 });
 
-// ---------- Admin: Monthly reminder (pledge) management ----------
+// ---------- Admin: per-network SMS status (MTN/Airtel/Zamtel/ZedMobile) ----------
+
+app.get("/api/networks/status", async (c) => {
+  const statuses: Record<string, string> = {};
+  for (const net of ZM_NETWORKS) {
+    statuses[net.id] = await networkStatus(c.env, net.id);
+  }
+  return c.json({ networks: statuses });
+});
+
+app.put("/api/admin/network-status", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json();
+  const statuses = (body.statuses ?? {}) as Record<string, string>;
+  for (const net of ZM_NETWORKS) {
+    const v = String(statuses[net.id] ?? "").toLowerCase();
+    if (v === "ok" || v === "down") {
+      await setSetting(c.env, `net_status_${net.id}`, v);
+    }
+  }
+  return c.json({ ok: true });
+});
 
 app.get("/api/admin/pledges", async (c) => {
   const admin = await requireAdmin(c);
@@ -1248,7 +1538,7 @@ const BACKUP_TABLES = [
   "campaign_sponsors", "user_links", "device_tokens", "referrals", "refunds",
   "admin_settings", "failed_logins", "support_tickets", "campaign_delete_requests",
   "receipt_downloads", "announcements", "short_links", "sms_events", "fee_sweeps",
-  "recurring_pledges", "promotions",
+  "recurring_pledges", "promotions", "lipila_logs", "airtime_orders", "host_badges",
 ];
 
 // Child-first so FK-friendly deletes succeed; inserts then run parent-first.
@@ -1257,7 +1547,7 @@ const BACKUP_DELETE_ORDER = [
   "campaign_delete_requests", "announcements", "promotions", "recurring_pledges",
   "short_links", "support_tickets", "refunds", "fee_sweeps", "failed_logins",
   "admin_settings", "otps", "campaign_sponsors", "contributions", "withdrawals",
-  "campaigns", "users", "app_settings",
+  "lipila_logs", "airtime_orders", "host_badges", "campaigns", "users", "app_settings",
 ];
 
 app.get("/api/admin/backup/export", async (c) => {
@@ -1320,26 +1610,20 @@ app.post("/api/admin/backup/restore", async (c) => {
   return c.json({ ok: true, restoredTables: names });
 });
 
-// ---------- admin short-link stats ----------
-
-app.get("/api/admin/short-links", async (c) => {
-  const admin = await requireAdmin(c);
-  if (!admin) return c.json({ error: "Admin only" }, 403);
-
-  const rows = await c.env.DB.prepare(
-    "SELECT sl.long_url, sl.short_url, sl.clicks, sl.created_at, " +
-    "c.id AS campaign_id, c.title AS campaign_title " +
-    "FROM short_links sl " +
-    "LEFT JOIN campaigns c ON c.id = CAST(SUBSTR(sl.long_url, INSTR(sl.long_url, '/share/') + 7) AS INTEGER) " +
-    "ORDER BY sl.clicks DESC LIMIT 100"
-  ).all<Record<string, any>>();
-
-  return c.json({ links: rows.results ?? [] });
-});
-
 // ---------- public campaign views ----------
 
 async function campaignPublic(env: Bindings, row: Record<string, any>): Promise<Record<string, any>> {
+  // Host display name (from row.host_name when the caller joined users, else looked up).
+  let hostName: string | null = row.host_name ?? null;
+  let hostVerified = !!row.host_verified;
+  let hostOrg: string | null = row.host_org ?? null;
+  if (!hostName && row.host_user_id != null) {
+    const host = await env.DB.prepare("SELECT username, host_verified, host_org FROM users WHERE id = ?")
+      .bind(row.host_user_id).first<{ username: string | null; host_verified: number | null; host_org: string | null }>();
+    hostName = host?.username ?? null;
+    hostVerified = !!host?.host_verified;
+    hostOrg = host?.host_org ?? null;
+  }
   // Single batched aggregate query instead of 4 separate ones (audit fix).
   const agg = (await env.DB.prepare(
     `SELECT COALESCE(SUM(amount_cents),0) AS s, COUNT(*) AS n,
@@ -1366,6 +1650,10 @@ async function campaignPublic(env: Bindings, row: Record<string, any>): Promise<
     slug: row.slug,
     title: row.title,
     description: row.description,
+    hostName,
+    hostVerified,
+    hostOrg,
+    campaignType: row.campaign_type ?? "community",
     blurb: String(row.description ?? "")
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
@@ -1387,15 +1675,26 @@ async function campaignPublic(env: Bindings, row: Record<string, any>): Promise<
     promoted: !!row.promoted,
     promotedUntil: row.promoted_until ?? null,
     status: row.status,
+    category: row.category ?? "Other",
+    visibility: row.visibility ?? "public",
     createdAt: row.created_at,
-    shareUrl: await shortenUrl(env, `${env.APP_URL}/share/${row.id}`),
+    shareUrl: `${env.APP_URL}/share/${row.id}`,
   };
 }
 
+// ---------- campaign categories ----------
+
+app.get("/api/campaign-categories", async (c) => {
+  return c.json({ categories: CAMPAIGN_CATEGORIES });
+});
+
 app.get("/api/campaigns", async (c) => {
+  const category = c.req.query("category");
   const rows = await c.env.DB.prepare(
-    "SELECT * FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC LIMIT 100"
-  ).all<Record<string, any>>();
+    category && isValidCategory(category)
+      ? "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.status = 'active' AND c.visibility = 'public' AND c.category = ? ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100"
+      : "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.status = 'active' AND c.visibility = 'public' ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100"
+  ).bind(...(category && isValidCategory(category) ? [category] : [])).all<Record<string, any>>();
   const out = [];
   for (const row of rows.results) {
     try {
@@ -1411,18 +1710,72 @@ app.get("/api/campaigns", async (c) => {
         donorCount: 0, donationCount: 0, avgDonationCents: 0, donorsNeededAtAvg: null,
         dailyRateCents: 0, estimatedEndDate: null, endsAt: row.ends_at ?? null,
         promoted: !!row.promoted, promotedUntil: row.promoted_until ?? null,
-        status: row.status, createdAt: row.created_at, shareUrl: null,
+        status: row.status, category: row.category ?? "Other",
+        createdAt: row.created_at, shareUrl: null,
       });
     }
   }
+
+  // Batch-shorten share URLs (1 SELECT for existing + INSERTs only for new
+  // campaigns) so the hot list path stays cheap and users never see the raw
+  // workers.dev link.
+  const longs = out.map((o) => o.shareUrl).filter((u): u is string => u != null);
+  if (longs.length > 0) {
+    const placeholders = longs.map(() => "?").join(",");
+    const existingRows = await c.env.DB.prepare(
+      `SELECT long_url, short_url FROM short_links WHERE long_url IN (${placeholders})`
+    ).bind(...longs).all<{ long_url: string; short_url: string }>();
+    const existing = new Map(existingRows.results.map((r) => [r.long_url, r.short_url]));
+    const base = shortBaseUrl(c.env);
+    for (const u of longs) {
+      if (existing.has(u)) continue;
+      const shortUrl = `${base}/go/${shortCodeFor(u)}`;
+      await c.env.DB.prepare(
+        "INSERT OR IGNORE INTO short_links (long_url, short_url, clicks) VALUES (?, ?, 0)"
+      ).bind(u, shortUrl).run();
+      existing.set(u, shortUrl);
+    }
+    for (const o of out) {
+      if (o.shareUrl) o.shareUrl = existing.get(o.shareUrl) ?? o.shareUrl;
+    }
+  }
+
   c.header("Cache-Control", "public, max-age=30");
   return c.json({ campaigns: out });
 });
 
+// Smart campaign search: matches title, description, host name, organisation
+// and category. Falls back gracefully to an empty result set.
+app.get("/api/campaigns/search", async (c) => {
+  const q = String(c.req.query("q") ?? "").trim().slice(0, 80);
+  if (!q) return c.json({ campaigns: [] });
+  const like = `%${q}%`;
+  const rows = await c.env.DB.prepare(
+    `SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org
+     FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id
+     WHERE c.status = 'active' AND c.visibility = 'public'
+       AND (c.title LIKE ? OR c.description LIKE ? OR c.category LIKE ?
+            OR u.username LIKE ? OR COALESCE(u.host_org,'') LIKE ?)
+     ORDER BY c.promoted DESC, c.created_at DESC LIMIT 50`
+  ).bind(like, like, like, like, like).all<Record<string, any>>();
+  const out = [];
+  for (const row of rows.results) {
+    try {
+      out.push(await campaignPublic(c.env, row));
+    } catch (e) {
+      console.error(`campaignPublic failed for ${row.id} during search:`, e);
+    }
+  }
+  return c.json({ campaigns: out });
+});
+
 app.get("/api/campaigns/:id", async (c) => {
-  const row = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(c.req.param("id")).first();
+  const row = await c.env.DB.prepare(
+    "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(c.req.param("id")).first();
   if (!row) return c.json({ error: "Campaign not found" }, 404);
   const pub = await campaignPublic(c.env, row);
+  pub.shareUrl = await createShortLink(c.env, `${c.env.APP_URL}/share/${row.id}`);
 
   const donors = await c.env.DB.prepare(
     `SELECT co.donor_user_id, u.username, u.avatar_url, co.donor_name, co.is_anonymous, co.hide_amount, co.amount_cents, co.created_at
@@ -1518,7 +1871,13 @@ app.post("/api/host/apply", async (c) => {
   const org = String(body.org ?? "").trim();
   const role = String(body.role ?? "").trim();
   const reason = String(body.reason ?? "").trim();
+  const kycType = body.kycType != null ? String(body.kycType).trim() : null;
+  const kycDocUrl = body.kycDocUrl != null ? String(body.kycDocUrl).trim() : null;
+  const kycNotes = body.kycNotes != null ? String(body.kycNotes).trim().slice(0, 500) : null;
   if (!org) return c.json({ error: "Organization name is required" }, 400);
+  if (kycType !== null && !(HOST_KYC_TYPES as readonly string[]).includes(kycType)) {
+    return c.json({ error: "Invalid KYC document type" }, 400);
+  }
 
   const current = await hostStatusOf(c.env, user.sub);
   if (current.host_status === "approved") {
@@ -1526,8 +1885,16 @@ app.post("/api/host/apply", async (c) => {
   }
 
   await c.env.DB.prepare(
-    `UPDATE users SET host_status = 'pending', host_org = ?, host_role = ?, host_reason = ?, host_rejection = NULL WHERE id = ?`
-  ).bind(org, role || null, reason || null, user.sub).run();
+    `UPDATE users SET host_status = 'pending', host_org = ?, host_role = ?, host_reason = ?, host_rejection = NULL,
+            host_kyc_status = ?, host_kyc_type = ?, host_kyc_doc_url = ?, host_kyc_notes = ? WHERE id = ?`
+  ).bind(org, role || null, reason || null,
+         kycType ? "submitted" : "none", kycType, kycDocUrl || null, kycNotes, user.sub).run();
+
+  // Alert the superadmin(s) so applications are reviewed fast.
+  await pushAdmins(c.env,
+    "New host application",
+    `${user.username ?? user.phone} applied to become a host (${org}).`,
+    { type: "host_application" }).catch(() => {});
 
   return c.json({ message: "Application submitted. You will be notified once approved.", hostStatus: "pending" });
 });
@@ -1553,10 +1920,15 @@ app.post("/api/campaigns", async (c) => {
   const body = await c.req.json();
   const title = String(body.title ?? "").trim();
   const description = String(body.description ?? "").trim();
+  const category = body.category != null ? String(body.category).trim() : "Other";
+  const visibility = body.visibility === "private" ? "private" : "public";
+  const campaignType = body.campaignType != null ? String(body.campaignType).trim() : "community";
   const goalCents = Math.round(Number(body.goalCents) || 0);
   const minWithdrawCents = Math.round(Number(body.minWithdrawCents) || 1000);
   const minSponsors = Math.max(1, Math.round(Number(body.minSponsors) || 1));
   if (!title || !description) return c.json({ error: "Title and description are required" }, 400);
+  if (!isValidCategory(category)) return c.json({ error: "Invalid campaign category" }, 400);
+  if (!(CAMPAIGN_TYPES as readonly string[]).includes(campaignType)) return c.json({ error: "Invalid campaign type" }, 400);
 
   let endsAt: string | null = null;
   if (body.endsAt) {
@@ -1573,12 +1945,14 @@ app.post("/api/campaigns", async (c) => {
   }
 
   const r = await c.env.DB.prepare(
-    "INSERT INTO campaigns (slug, title, description, goal_cents, min_withdraw_cents, host_user_id, ends_at, min_sponsors) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).bind(slug, title, description, goalCents, minWithdrawCents, user.sub, endsAt, minSponsors).run();
+    "INSERT INTO campaigns (slug, title, description, goal_cents, min_withdraw_cents, host_user_id, ends_at, min_sponsors, category, visibility, campaign_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(slug, title, description, goalCents, minWithdrawCents, user.sub, endsAt, minSponsors, category, visibility, campaignType).run();
 
   const campaignId = Number(r.meta?.last_row_id ?? 0);
 
-  // Notify past donors of this host's campaigns about the new campaign.
+  // Notify past donors of this host's campaigns about the new campaign
+  // (only public ones â€” a private campaign is shared by the host directly).
+  if (visibility === "public") {
   const pastDonors = await c.env.DB.prepare(
     "SELECT DISTINCT u.id, u.fcm_token FROM contributions co JOIN campaigns c ON c.id = co.campaign_id JOIN users u ON u.id = co.donor_user_id WHERE c.host_user_id = ? AND u.fcm_token IS NOT NULL LIMIT 50"
   ).bind(user.sub).all<{ id: number; fcm_token: string }>();
@@ -1589,6 +1963,7 @@ app.post("/api/campaigns", async (c) => {
       `${user.username ?? "Someone you support"} just started "${title}". Give now on Kingdom Sponsor.`,
       { type: "new_campaign", campaignId: String(campaignId) }
     ).catch((e) => console.error("new campaign push failed:", e));
+  }
   }
 
   return c.json({ id: campaignId, slug }, 201);
@@ -1612,6 +1987,18 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   const minWithdrawCents = body.minWithdrawCents != null ? Math.round(Number(body.minWithdrawCents)) : null;
   const minSponsors = body.minSponsors != null ? Math.max(1, Math.round(Number(body.minSponsors))) : null;
   const status = body.status != null ? String(body.status) : null;
+  const category = body.category != null ? String(body.category).trim() : null;
+  const visibility = body.visibility != null ? String(body.visibility) : null;
+  const campaignType = body.campaignType != null ? String(body.campaignType).trim() : null;
+  if (category !== null && !isValidCategory(category)) {
+    return c.json({ error: "Invalid campaign category" }, 400);
+  }
+  if (visibility !== null && !["public", "private"].includes(visibility)) {
+    return c.json({ error: "Invalid visibility" }, 400);
+  }
+  if (campaignType !== null && !(CAMPAIGN_TYPES as readonly string[]).includes(campaignType)) {
+    return c.json({ error: "Invalid campaign type" }, 400);
+  }
 
   let endsAt: string | null = null;
   if (body.endsAt != null) {
@@ -1637,6 +2024,9 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   if (minWithdrawCents !== null) { sets.push("min_withdraw_cents = ?"); vals.push(minWithdrawCents); }
   if (minSponsors !== null) { sets.push("min_sponsors = ?"); vals.push(minSponsors); }
   if (status !== null) { sets.push("status = ?"); vals.push(status); }
+  if (category !== null) { sets.push("category = ?"); vals.push(category); }
+  if (visibility !== null) { sets.push("visibility = ?"); vals.push(visibility); }
+  if (campaignType !== null) { sets.push("campaign_type = ?"); vals.push(campaignType); }
   if (endsAt !== null) { sets.push("ends_at = ?"); vals.push(endsAt); }
 
   if (sets.length === 0) return c.json({ error: "No fields to update" }, 400);
@@ -1665,6 +2055,88 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   }
 
   return c.json({ ok: true, campaign: updated });
+});
+
+// ---------- Host: edit their own campaign ----------
+
+app.put("/api/campaigns/:id", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT * FROM campaigns WHERE id = ?"
+  ).bind(c.req.param("id")).first<Record<string, any>>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.host_user_id !== user.sub) {
+    return c.json({ error: "You can only request changes to your own campaigns" }, 403);
+  }
+  if (campaign.status === "deleted") {
+    return c.json({ error: "This campaign is deleted and can no longer be edited." }, 400);
+  }
+
+  const body = await c.req.json();
+
+  // Hosts cannot edit campaigns directly (fraud protection). Validate the
+  // proposed fields, then store them for a superadmin to review and apply.
+  const proposed: Record<string, any> = {};
+  const allowed: Array<[string, (v: any) => any | null]> = [
+    ["title", (v) => (v != null ? String(v).trim() : null)],
+    ["description", (v) => (v != null ? String(v).trim() : null)],
+    ["goalCents", (v) => (v != null ? Math.round(Number(v)) : null)],
+    ["minWithdrawCents", (v) => (v != null ? Math.round(Number(v)) : null)],
+    ["category", (v) => (v != null ? String(v).trim() : null)],
+    ["visibility", (v) => (v != null ? String(v) : null)],
+    ["campaignType", (v) => (v != null ? String(v).trim() : null)],
+  ];
+  for (const [key, clean] of allowed) {
+    if (key in body) proposed[key] = clean(body[key]);
+  }
+
+  // Ends-at handling (null clears it).
+  if ("endsAt" in body) {
+    if (body.endsAt === null) proposed.endsAt = null;
+    else {
+      const parsed = new Date(String(body.endsAt));
+      if (isNaN(parsed.getTime())) return c.json({ error: "endsAt must be a valid date" }, 400);
+      proposed.endsAt = parsed.toISOString().slice(0, 10);
+    }
+  }
+
+  if (Object.keys(proposed).length === 0) {
+    return c.json({ error: "No changes to request" }, 400);
+  }
+  if (proposed.category != null && !isValidCategory(proposed.category)) {
+    return c.json({ error: "Invalid campaign category" }, 400);
+  }
+  if (proposed.visibility != null && !["public", "private"].includes(proposed.visibility)) {
+    return c.json({ error: "Invalid visibility" }, 400);
+  }
+  if (proposed.campaignType != null && !(CAMPAIGN_TYPES as readonly string[]).includes(proposed.campaignType)) {
+    return c.json({ error: "Invalid campaign type" }, 400);
+  }
+  if (proposed.title === "") return c.json({ error: "Title cannot be empty" }, 400);
+
+  // Prevent duplicate pending requests for the same campaign.
+  const dup = await c.env.DB.prepare(
+    "SELECT id FROM campaign_edit_requests WHERE campaign_id = ? AND status = 'pending' LIMIT 1"
+  ).bind(campaign.id).first<{ id: number }>();
+  if (dup) {
+    return c.json({ error: "You already have a pending edit request for this campaign. Wait for the admin to review it." }, 409);
+  }
+
+  await c.env.DB.prepare(
+    "INSERT INTO campaign_edit_requests (campaign_id, host_user_id, proposed_json) VALUES (?, ?, ?)"
+  ).bind(campaign.id, user.sub, JSON.stringify(proposed)).run();
+
+  // Notify superadmins so the request is reviewed promptly.
+  await pushAdmins(c.env, "Campaign edit request",
+    `${user.username ?? user.phone} requested changes to "${campaign.title}".`,
+    { type: "campaign_edit_request", campaignId: String(campaign.id) }).catch(() => {});
+
+  return c.json({
+    ok: true,
+    message: "Your edit request has been submitted for review. You'll be notified once approved.",
+  });
 });
 
 // ---------- Group Campaigns (multi-sponsor unlock) ----------
@@ -1718,7 +2190,7 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
       accountNumber: phone.replace("+", ""),
       narration: `Kingdom Sponsor donation to ${campaign.title}`,
       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
-    });
+    }, c.env.DB);
     await c.env.DB.prepare(
       "UPDATE contributions SET lipila_identifier = ? WHERE id = ?"
     ).bind(result.identifier, r.meta.last_row_id).run();
@@ -1733,7 +2205,94 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
     await c.env.DB.prepare(
       "UPDATE contributions SET status = 'failed' WHERE id = ?"
     ).bind(r.meta.last_row_id).run();
+    const msg = e instanceof Error ? e.message : String(e);
+    await logLipilaEvent(c.env.DB, "collection", referenceId, phone, totalCents, msg);
     console.error("collection failed:", e);
+    return c.json({ error: "Payment could not be started. Try again." }, 502);
+  }
+});
+
+// Card donations â€” same flow as mobile money, but the payer completes the
+// payment on Lipila's hosted checkout (cardRedirectionUrl) instead of a
+// USSD prompt. Disbursements stay mobile-money only.
+app.post("/api/campaigns/:id/contribute-card", async (c) => {
+  const user = await authUser(c);
+  const body = await c.req.json().catch(() => ({}));
+  const amountCents = Math.round(Number(body.amountCents) || 0);
+  if (amountCents < 100) return c.json({ error: "Minimum donation is K1.00" }, 400);
+
+  const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(c.req.param("id")).first();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.status !== "active") return c.json({ error: "Campaign is closed" }, 400);
+
+  const email = String(body.email ?? "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return c.json({ error: "Enter a valid email address for the card receipt" }, 400);
+  }
+  const phone = normalizePhone(body.phone ?? user?.phone ?? "");
+  if (!/^\+260\d{9}$/.test(phone)) {
+    return c.json({ error: "Enter a valid Zambian phone number" }, 400);
+  }
+  const fullName = String(body.donorName ?? "").trim();
+  const nameParts = fullName.split(/\s+/);
+  const firstName = nameParts[0] || "Kingdom";
+  const lastName = nameParts.slice(1).join(" ") || "Sponsor";
+
+  const donor = await ensureUser(c.env.DB, phone);
+  const recent = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM contributions WHERE phone = ? AND created_at > datetime('now', '-1 minute')"
+  ).bind(phone).first<{ n: number }>())?.n ?? 0;
+  if (recent >= 3) return c.json({ error: "Too many attempts. Wait a moment and try again." }, 429);
+
+  const cfg = loadFeeConfig(c.env);
+  const fees = donationFees(amountCents, cfg, "card");
+  const totalCents = amountCents + fees.platformFeeCents + fees.lipilaFeeCents;
+  const referenceId = `CON-${campaign.id}-${Date.now()}`;
+
+  const r = await c.env.DB.prepare(
+    `INSERT INTO contributions (campaign_id, donor_user_id, donor_name, is_anonymous, hide_amount, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+  ).bind(
+    campaign.id,
+    donor.id,
+    fullName || null,
+    body.isAnonymous ? 1 : 0,
+    body.hideAmount ? 1 : 0,
+    phone,
+    amountCents,
+    fees.platformFeeCents,
+    fees.lipilaFeeCents,
+    referenceId
+  ).run();
+
+  try {
+    const result = await createCardCollection(c.env, {
+      referenceId,
+      amountCents: totalCents,
+      narration: `Kingdom Sponsor donation to ${campaign.title}`,
+      callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
+      customerInfo: { firstName, lastName, phoneNumber: phone, email },
+      backUrl: `${c.env.APP_URL}/share/${campaign.id}`,
+      referenceData: `Kingdom Sponsor donation ${campaign.id}`,
+    }, c.env.DB);
+    await c.env.DB.prepare(
+      "UPDATE contributions SET lipila_identifier = ? WHERE id = ?"
+    ).bind(result.identifier, r.meta.last_row_id).run();
+    return c.json({
+      referenceId,
+      cardRedirectionUrl: result.cardRedirectionUrl,
+      message: "Complete your payment in the secure checkout window.",
+      platformFeeCents: fees.platformFeeCents,
+      lipilaFeeCents: fees.lipilaFeeCents,
+      totalCents,
+    });
+  } catch (e) {
+    await c.env.DB.prepare(
+      "UPDATE contributions SET status = 'failed' WHERE id = ?"
+    ).bind(r.meta.last_row_id).run();
+    const msg = e instanceof Error ? e.message : String(e);
+    await logLipilaEvent(c.env.DB, "collection", referenceId, phone, totalCents, msg);
+    console.error("card collection failed:", e);
     return c.json({ error: "Payment could not be started. Try again." }, 502);
   }
 });
@@ -1781,6 +2340,17 @@ app.post("/api/contributions/:referenceId/resend-prompt", async (c) => {
     "SELECT * FROM contributions WHERE lipila_reference = ?"
   ).bind(oldRef).first<Record<string, any>>();
   if (!row) return c.json({ error: "Not found" }, 404);
+
+  // IDOR guard: only the donor, the campaign host, or an admin may resend.
+  const campaignCheck = await c.env.DB.prepare(
+    "SELECT host_user_id FROM campaigns WHERE id = ?"
+  ).bind(row.campaign_id).first<{ host_user_id: number }>();
+  const isOwner = row.donor_user_id === user.sub || row.phone === user.phone;
+  const isHost = campaignCheck?.host_user_id === user.sub;
+  const isAdmin = isAdminPhone(c.env, user.phone);
+  if (!isOwner && !isHost && !isAdmin) {
+    return c.json({ error: "Not authorized to resend this prompt" }, 403);
+  }
   if (row.status !== "pending") {
     return c.json({ error: "This payment is no longer waiting for your PIN." }, 400);
   }
@@ -1806,7 +2376,7 @@ app.post("/api/contributions/:referenceId/resend-prompt", async (c) => {
       accountNumber: row.phone.replace("+", ""),
       narration: `Kingdom Sponsor donation to ${campaign.title}`,
       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
-    });
+    }, c.env.DB);
     await c.env.DB.prepare(
       "UPDATE contributions SET lipila_identifier = ? WHERE id = ?"
     ).bind(result.identifier, row.id).run();
@@ -2067,7 +2637,7 @@ app.post("/api/campaigns/:id/gift", async (c) => {
       accountNumber: phone.replace("+", ""),
       narration: `Kingdom Sponsor gift to ${campaign.title}`,
       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
-    });
+    }, c.env.DB);
     await c.env.DB.prepare("UPDATE contributions SET lipila_identifier = ? WHERE id = ?")
       .bind(result.identifier, r.meta.last_row_id).run();
     return c.json({
@@ -2135,7 +2705,9 @@ app.get("/api/campaigns/:id/group-status", async (c) => {
     sponsors: sponsors.results.map((s) => ({
       userId: s.user_id,
       username: s.username,
-      phone: s.phone,
+      // Phones are private (schema rule); expose only a masked hint so the
+      // collaboration view shows who is in the group without leaking PII.
+      phoneMasked: s.phone ? maskPhone(s.phone) : null,
       joinedAt: s.joined_at,
     })),
   });
@@ -2174,9 +2746,7 @@ app.post("/api/campaigns/:id/announcements", async (c) => {
   ).bind(c.req.param("id")).first<Record<string, any>>();
   if (!campaign) return c.json({ error: "Campaign not found" }, 404);
 
-  const me = await c.env.DB.prepare("SELECT is_admin FROM users WHERE id = ?")
-    .bind(user.sub).first<Record<string, any>>();
-  if (me?.is_admin !== 1) {
+  if (!isAdminPhone(c.env, user.phone)) {
     return c.json({ error: "Admin only" }, 403);
   }
 
@@ -2255,7 +2825,7 @@ app.post("/api/user/link", async (c) => {
   const acceptLink = `${c.env.APP_URL}/links/${linkId}/accept`;
   const rejectLink = `${c.env.APP_URL}/links/${linkId}/reject`;
   await sendSms(c.env, target.phone,
-    `${me?.username ?? "A Kingdom Sponsor user"} wants to link as ${linkType}. Accept: ${acceptLink}  Decline: ${rejectLink}  (or open the app)`
+    `KSPONSOR: ${me?.username ?? "A Kingdom Sponsor user"} wants to link accounts with you as ${linkType}.\nAccept: ${acceptLink}\nDecline: ${rejectLink}`
   ).catch((e) => console.error("link sms failed:", e));
 
   return c.json({ ok: true, message: "Link request sent. Waiting for acceptance." });
@@ -2394,6 +2964,14 @@ app.post("/api/campaigns/:id/promote", async (c) => {
     return c.json({ error: "All promotion slots are taken. Wait for a slot to open." }, 409);
   }
 
+  // Idempotency: reject while a payment or approval is already in flight.
+  const inFlight = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM promotions WHERE campaign_id = ? AND status IN ('pending','pending_approval')"
+  ).bind(campaign.id).first<{ n: number }>())?.n ?? 0;
+  if (inFlight > 0) {
+    return c.json({ error: "A promotion request for this campaign is already being processed." }, 409);
+  }
+
   const price = await promoPrice(c.env);
   const days = await promoDays(c.env);
   const referenceId = `PRO-${campaign.id}-${Date.now()}`;
@@ -2409,7 +2987,7 @@ app.post("/api/campaigns/:id/promote", async (c) => {
       accountNumber: user.phone.replace("+", ""),
       narration: `Kingdom Sponsor promotion for ${campaign.title}`,
       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
-    });
+    }, c.env.DB);
     await c.env.DB.prepare("UPDATE promotions SET lipila_reference = ? WHERE id = ?")
       .bind(referenceId, r.meta.last_row_id).run();
     return c.json({
@@ -2508,8 +3086,22 @@ app.get("/api/me/referral", async (c) => {
   const user = await authUser(c);
   if (!user) return c.json({ error: "Not authenticated" }, 401);
   const code = await ensureReferralCode(c.env, user.sub);
-  const shareUrl = await shortenUrl(c.env, `${c.env.APP_URL}/share?ref=${code}`);
-  return c.json({ code, shareUrl });
+  const shareUrl = await createShortLink(c.env, `${c.env.APP_URL}/share?ref=${code}`);
+  const total = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM referrals WHERE referrer_user_id = ?"
+  ).bind(user.sub).first<{ n: number }>())?.n ?? 0;
+  const rewardedAt = await c.env.DB.prepare(
+    "SELECT referral_rewarded_at FROM users WHERE id = ?"
+  ).bind(user.sub).first<{ referral_rewarded_at: string | null }>();
+  const threshold = await referralRewardThreshold(c.env);
+  return c.json({
+    code,
+    shareUrl,
+    total,
+    threshold,
+    eligible: total >= threshold && !rewardedAt?.referral_rewarded_at,
+    rewardedAt: rewardedAt?.referral_rewarded_at ?? null,
+  });
 });
 
 app.get("/api/me/referrals", async (c) => {
@@ -2531,6 +3123,7 @@ app.get("/api/me/referrals", async (c) => {
   return c.json({
     total: stats.total,
     last30d: stats.last30d,
+    threshold: await referralRewardThreshold(c.env),
     referrals: rows.results.map((r) => ({
       username: r.username ?? "Giver",
       phone: r.phone,
@@ -2552,6 +3145,15 @@ interface ReceiptInput {
   reference: string;
   date: string;
   status: string;
+}
+
+/** Capitalizes the first letter of every word (used on PDF receipts for names). */
+function toTitleCase(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
 }
 
 async function buildReceiptPdf(env: Bindings, i: ReceiptInput): Promise<Uint8Array> {
@@ -2659,7 +3261,7 @@ async function buildReceiptPdf(env: Bindings, i: ReceiptInput): Promise<Uint8Arr
   y -= 14;
   page.drawText("This receipt was issued automatically and records your gift for your records.", { x: 50, y, size: 9, font, color: textMuted });
   y -= 12;
-  page.drawText("Kingdom Sponsor  •  Built with Purpose", { x: 50, y, size: 8, font, color: rgb(0.55, 0.55, 0.55) });
+  page.drawText("Kingdom Sponsor  â€¢  Built with Purpose", { x: 50, y, size: 8, font, color: rgb(0.55, 0.55, 0.55) });
 
   return doc.save();
 }
@@ -2694,9 +3296,9 @@ app.get("/api/contributions/:id/receipt", async (c) => {
   const donorName = row.is_anonymous ? "Anonymous" : (String(row.donor_name ?? "").trim() || "Anonymous");
   const pdf = await buildReceiptPdf(c.env, {
     receiptNumber: `KS-${String(row.id).padStart(6, "0")}`,
-    donorName,
+    donorName: toTitleCase(donorName),
     donorPhone: row.phone,
-    campaignTitle: row.campaign_title,
+    campaignTitle: toTitleCase(row.campaign_title),
     amountCents: row.amount_cents,
     platformFeeCents: row.platform_fee_cents,
     lipilaFeeCents: row.lipila_fee_cents,
@@ -2760,6 +3362,21 @@ app.post("/api/support/tickets", async (c) => {
     "New support request", `#${ticketId}: ${subject}`,
     { type: "ticket_created", ticketId: String(ticketId) }).catch(() => {});
 
+  // Friendly auto-acknowledgement for greeting-style messages: the user gets
+  // an instant "we've got you" confirmation while an admin drafts a real reply.
+  // Kept short and honest so it never looks like a human answered.
+  if (/(\bhi\b|\bhello\b|\bhey\b|greetings|good (morning|afternoon|evening)|good day|how are you|thank(s| you)|please help|help me|can you help|i need help|i have a (question|problem|complaint))/i.test(message)) {
+    const assistantName = await supportAssistantName(c.env);
+    const ack = `Thanks for reaching out${user.username ? `, ${user.username}` : ""}! This is an automatic confirmation â€” your request #${ticketId} ("${subject}") has been received and an admin will reply here shortly.\nâ€” ${assistantName}`;
+    await c.env.DB.prepare(
+      "UPDATE support_tickets SET admin_reply = ?, status = 'answered', updated_at = datetime('now', '+2 hours') WHERE id = ?"
+    ).bind(ack, ticketId).run();
+    await pushToUser(c.env, Number(user.sub), "We got your request",
+      `Thanks for contacting us${user.username ? `, ${user.username}` : ""}! An admin will reply to "${subject}" shortly.\nâ€” ${assistantName}`,
+      { type: "ticket_ack", ticketId: String(ticketId) })
+      .catch((e) => console.error("ticket ack push failed:", e));
+  }
+
   return c.json({ ok: true, id: ticketId });
 });
 
@@ -2798,21 +3415,20 @@ app.post("/api/support/tickets/:id/reply", async (c) => {
   ).bind(c.req.param("id")).first<Record<string, any>>();
   if (!ticket) return c.json({ error: "Ticket not found" }, 404);
 
-  const me = await c.env.DB.prepare("SELECT is_admin FROM users WHERE id = ?")
-    .bind(user.sub).first<{ is_admin: number | null }>();
+  const isAdmin = isAdminPhone(c.env, user.phone);
 
-  if (me?.is_admin === 1) {
+  if (isAdmin) {
     // Admin answers: mark answered and notify the user.
     await c.env.DB.prepare(
       "UPDATE support_tickets SET admin_reply = ?, status = 'answered', updated_at = datetime('now', '+2 hours') WHERE id = ?"
     ).bind(text, ticket.id).run();
-    await smsIfNoPush(c.env, ticket.user_id, ticket.phone, supportReplySms(ticket.subject));
+    await smsIfNoPush(c.env, ticket.user_id, ticket.phone, supportReplySms(ticket.subject, await supportAssistantName(c.env)));
     await pushToUser(c.env, ticket.user_id, "Support replied",
       `Your request "${ticket.subject}" has a new reply.`, { type: "ticket_reply", ticketId: String(ticket.id) })
       .catch((e) => console.error("ticket reply push failed:", e));
   } else {
     // User replies: reopen the ticket.
-    if (ticket.user_id !== user.sub) return c.json({ error: "Not your ticket" }, 403);
+    if (Number(ticket.user_id) !== Number(user.sub)) return c.json({ error: "Not your ticket" }, 403);
     await c.env.DB.prepare(
       "UPDATE support_tickets SET message = ?, status = 'open', updated_at = datetime('now', '+2 hours') WHERE id = ?"
     ).bind(text, ticket.id).run();
@@ -2848,7 +3464,22 @@ app.get("/api/admin/tickets", async (c) => {
       createdAt: t.created_at,
       updatedAt: t.updated_at,
     })),
+    assistantName: await supportAssistantName(c.env),
   });
+});
+
+// ---------- admin: support assistant name (signature on reply SMS) ----------
+
+app.put("/api/admin/support-config", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const body = await c.req.json();
+  const name = String(body.assistantName ?? "").trim();
+  if (!name || name.length > 60) return c.json({ error: "Assistant name is required (max 60 characters)." }, 400);
+
+  await setSetting(c.env, "support_assistant_name", name);
+  return c.json({ ok: true, assistantName: name });
 });
 
 // ---------- admin: resolve a support ticket ----------
@@ -2957,7 +3588,7 @@ async function deleteCampaign(env: Bindings, campaignId: number, reason?: string
   const donorBody = `This campaign was removed by the administrator.${note}`;
 
   if (campaign.host_phone) {
-    await sendSms(env, campaign.host_phone, `Kingdom Sponsor: "${campaign.title}" has been removed from the platform.${note}`)
+    await sendSms(env, campaign.host_phone, `KSPONSOR: Your campaign "${campaign.title}" has been removed from the platform.${note}`)
       .catch((e) => console.error("campaign-deleted sms failed:", e));
     await pushToUser(env, campaign.host_user_id, "Campaign removed", hostBody, { type: "campaign_deleted", campaignId: String(campaignId) })
       .catch((e) => console.error("campaign-deleted push failed:", e));
@@ -2984,10 +3615,105 @@ async function deleteCampaign(env: Bindings, campaignId: number, reason?: string
          SELECT 1 FROM device_tokens dt WHERE dt.user_id = co.donor_user_id))`
   ).bind(campaignId).all<{ phone: string }>();
   for (const row of smsPhones.results) {
-    await sendSms(env, row.phone, `Kingdom Sponsor: "${campaign.title}" was removed by the administrator.${note}`)
+    await sendSms(env, row.phone, `KSPONSOR: The campaign "${campaign.title}" you supported has been removed by the administrator.${note}`)
       .catch((e) => console.error("campaign-deleted donor sms failed:", e));
   }
 }
+
+/** Append an entry to the admin audit log (destructive/sensitive actions only). */
+async function logAdminAction(  env: Bindings,
+  actorUserId: number | null | undefined,
+  action: string,
+  targetType: string,
+  targetId: string | number | null,
+  details?: string
+): Promise<void> {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO admin_actions (actor_user_id, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?)"
+    ).bind(actorUserId ?? null, action, targetType, targetId != null ? String(targetId) : null, details?.slice(0, 500) ?? null).run();
+  } catch (e) {
+    console.error("admin action log failed:", e);
+  }
+}
+
+/** Restores a soft-deleted campaign to 'active' (undo of an admin delete). */
+async function restoreCampaign(env: Bindings, campaignId: number): Promise<boolean> {
+  const res = await env.DB.prepare(
+    "UPDATE campaigns SET status = 'active' WHERE id = ? AND status = 'deleted'"
+  ).bind(campaignId).run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
+/** Restore a soft-deleted campaign (superadmin or 'restore'-scoped staff). */
+app.post("/api/admin/campaigns/:id/restore", async (c) => {
+  const staff = await requireStaff(c, "restore");
+  if (!staff) return c.json({ error: "Admin only" }, 403);
+  const campaignId = Number(c.req.param("id"));
+  const campaign = await c.env.DB.prepare("SELECT id, title, status FROM campaigns WHERE id = ?")
+    .bind(campaignId).first<{ id: number; title: string; status: string }>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.status !== "deleted") return c.json({ error: "Campaign is not deleted." }, 400);
+
+  await restoreCampaign(c.env, campaignId);
+  await logAdminAction(c.env, staff.sub, "campaign_restore", "campaign", campaignId, `Restored "${campaign.title}"`);
+
+  const host = await c.env.DB.prepare(
+    "SELECT u.phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(campaignId).first<{ phone: string; host_user_id: number }>();
+  if (host?.phone) {
+    await sendSms(c.env, host.phone, `KSPONSOR: Good news — your campaign "${campaign.title}" has been restored and is live again.`)
+      .catch((e) => console.error("campaign-restore sms failed:", e));
+    await pushToUser(c.env, host.host_user_id, "Campaign restored",
+      `"${campaign.title}" is live again after being restored by the administrator.`,
+      { type: "campaign_restored", campaignId: String(campaignId) })
+      .catch((e) => console.error("campaign-restore push failed:", e));
+  }
+
+  return c.json({ ok: true, message: `"${campaign.title}" restored.` });
+});
+
+/** List recent sensitive admin actions (superadmin only). */
+app.get("/api/admin/actions", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const rows = await c.env.DB.prepare(
+    `SELECT a.id, a.actor_user_id, a.action, a.target_type, a.target_id, a.details, a.created_at, u.username AS actor_name
+     FROM admin_actions a LEFT JOIN users u ON u.id = a.actor_user_id
+     ORDER BY a.id DESC LIMIT 100`
+  ).all<Record<string, any>>();
+  return c.json({
+    actions: rows.results.map((r) => ({
+      id: r.id,
+      actorUserId: r.actor_user_id,
+      actorName: r.actor_name ?? "Admin",
+      action: r.action,
+      targetType: r.target_type,
+      targetId: r.target_id,
+      details: r.details,
+      createdAt: r.created_at,
+    })),
+  });
+});
+
+/** List soft-deleted campaigns (restorable) — superadmin or 'restore'-scoped staff. */
+app.get("/api/admin/campaigns/deleted", async (c) => {
+  const staff = await requireStaff(c, "restore");
+  if (!staff) return c.json({ error: "Admin only" }, 403);
+  const rows = await c.env.DB.prepare(
+    `SELECT c.id, c.title, c.status, c.created_at, u.username AS host_name, u.host_verified, u.host_org AS host_org
+     FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id
+     WHERE c.status = 'deleted' ORDER BY c.updated_at DESC LIMIT 100`
+  ).all<Record<string, any>>();
+  return c.json({
+    campaigns: rows.results.map((r) => ({
+      id: r.id,
+      title: r.title,
+      hostName: r.host_name ?? null,
+      createdAt: r.created_at,
+    })),
+  });
+});
 
 app.post("/api/admin/campaigns/:id/delete", async (c) => {
   const admin = await requireAdmin(c);
@@ -3002,6 +3728,7 @@ app.post("/api/admin/campaigns/:id/delete", async (c) => {
   const reason = String(body.reason ?? "").trim().slice(0, 500) || null;
 
   await deleteCampaign(c.env, campaign.id, reason);
+  await logAdminAction(c.env, admin.sub, "campaign_delete", "campaign", campaign.id, reason ? `"${campaign.title}" — ${reason}` : `"${campaign.title}"`);
   await c.env.DB.prepare(
     "UPDATE campaign_delete_requests SET status = 'approved', resolved_at = datetime('now', '+2 hours') WHERE campaign_id = ? AND status = 'pending'"
   ).bind(campaign.id).run();
@@ -3049,6 +3776,110 @@ app.post("/api/admin/delete-requests/:id/reject", async (c) => {
   return c.json({ ok: true });
 });
 
+// ---------- Admin: review host campaign-edit requests ----------
+
+app.get("/api/admin/edit-requests", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const rows = await c.env.DB.prepare(
+    `SELECT r.id, r.campaign_id, r.host_user_id, r.proposed_json, r.status, r.admin_notes, r.created_at,
+            c.title AS campaign_title, u.username AS host_name, u.host_verified, u.host_org AS host_org
+     FROM campaign_edit_requests r
+     JOIN campaigns c ON c.id = r.campaign_id
+     JOIN users u ON u.id = r.host_user_id
+     ORDER BY (r.status = 'pending') DESC, r.created_at DESC LIMIT 100`
+  ).all<Record<string, any>>();
+  return c.json({
+    requests: rows.results.map((r) => ({
+      id: r.id,
+      campaignId: r.campaign_id,
+      campaignTitle: r.campaign_title,
+      hostUserId: r.host_user_id,
+      hostName: r.host_name ?? "Giver",
+      proposed: JSON.parse(r.proposed_json || "{}"),
+      status: r.status,
+      adminNotes: r.admin_notes ?? null,
+      createdAt: r.created_at,
+    })),
+  });
+});
+
+app.post("/api/admin/edit-requests/:id/approve", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const req = await c.env.DB.prepare("SELECT * FROM campaign_edit_requests WHERE id = ? AND status = 'pending'")
+    .bind(c.req.param("id")).first<Record<string, any>>();
+  if (!req) return c.json({ error: "Request not found or already resolved" }, 404);
+
+  const proposed = JSON.parse(req.proposed_json || "{}");
+  const sets: string[] = [];
+  const vals: any[] = [];
+  if (proposed.title !== undefined) { sets.push("title = ?"); vals.push(proposed.title); }
+  if (proposed.description !== undefined) { sets.push("description = ?"); vals.push(proposed.description); }
+  if (proposed.goalCents !== undefined) { sets.push("goal_cents = ?"); vals.push(proposed.goalCents); }
+  if (proposed.minWithdrawCents !== undefined) { sets.push("min_withdraw_cents = ?"); vals.push(proposed.minWithdrawCents); }
+  if (proposed.category !== undefined) { sets.push("category = ?"); vals.push(proposed.category); }
+  if (proposed.visibility !== undefined) { sets.push("visibility = ?"); vals.push(proposed.visibility); }
+  if (proposed.campaignType !== undefined) { sets.push("campaign_type = ?"); vals.push(proposed.campaignType); }
+  if ("endsAt" in proposed) { sets.push("ends_at = ?"); vals.push(proposed.endsAt); }
+
+  if (sets.length > 0) {
+    vals.push(req.campaign_id);
+    await c.env.DB.prepare(
+      `UPDATE campaigns SET ${sets.join(", ")} WHERE id = ?`
+    ).bind(...vals).run();
+  }
+
+  await c.env.DB.prepare(
+    "UPDATE campaign_edit_requests SET status = 'approved', resolved_at = datetime('now', '+2 hours') WHERE id = ?"
+  ).bind(req.id).run();
+  await logAdminAction(c.env, admin.sub, "campaign_edit_approve", "campaign", req.campaign_id,
+    `Approved edit request #${req.id} on "${req.campaign_id}"`);
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT c.title, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(req.campaign_id).first<Record<string, any>>();
+  if (campaign?.host_phone) {
+    await sendSms(c.env, campaign.host_phone, editRequestApprovedSms(campaign.title))
+      .catch((e) => console.error("edit-approve sms failed:", e));
+    await pushToUser(c.env, campaign.host_user_id, "Campaign update approved",
+      `Your requested changes to "${campaign.title}" have been approved and applied.`,
+      { type: "campaign_edit_approved", campaignId: String(req.campaign_id) })
+      .catch((e) => console.error("edit-approve push failed:", e));
+  }
+  return c.json({ ok: true, message: "Edit request approved and applied." });
+});
+
+app.post("/api/admin/edit-requests/:id/reject", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const req = await c.env.DB.prepare("SELECT * FROM campaign_edit_requests WHERE id = ? AND status = 'pending'")
+    .bind(c.req.param("id")).first<Record<string, any>>();
+  if (!req) return c.json({ error: "Request not found or already resolved" }, 404);
+
+  const body = await c.req.json().catch(() => ({}));
+  const notes = String(body.notes ?? "").trim().slice(0, 500) || null;
+
+  await c.env.DB.prepare(
+    "UPDATE campaign_edit_requests SET status = 'rejected', admin_notes = ?, resolved_at = datetime('now', '+2 hours') WHERE id = ?"
+  ).bind(notes, req.id).run();
+  await logAdminAction(c.env, admin.sub, "campaign_edit_reject", "campaign", req.campaign_id,
+    `Rejected edit request #${req.id}${notes ? ` — ${notes}` : ""}`);
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT c.title, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
+  ).bind(req.campaign_id).first<Record<string, any>>();
+  if (campaign?.host_phone) {
+    await pushToUser(c.env, campaign.host_user_id, "Campaign update declined",
+      `Your requested changes to "${campaign.title}" were declined.${notes ? ` Reason: ${notes}` : ""}`,
+      { type: "campaign_edit_rejected", campaignId: String(req.campaign_id) })
+      .catch((e) => console.error("edit-reject push failed:", e));
+  }
+  return c.json({ ok: true });
+});
+
 // ---------- Admin: Ban/unban users, hosts, or phone numbers ----------
 
 app.post("/api/admin/ban", async (c) => {
@@ -3060,7 +3891,7 @@ app.post("/api/admin/ban", async (c) => {
   const reason = String(body.reason ?? "").trim() || "Banned by admin";
   const kind = body.kind ?? "phone"; // phone | user_id | host
 
-  if (!target) return c.json({ error: "Target is required" }, 400);
+  if (!target && kind !== "host") return c.json({ error: "Target is required" }, 400);
 
   if (kind === "phone") {
     const user = await c.env.DB.prepare(
@@ -3141,6 +3972,95 @@ app.get("/api/admin/banned", async (c) => {
   return c.json({ banned: rows.results });
 });
 
+// ---------- admin referrals (reward qualified referrers) ----------
+
+/** List all referrers with their invite counts and reward status, plus the
+ *  configurable threshold. Qualifying users can be rewarded by an admin. */
+app.get("/api/admin/referrals", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const threshold = await referralRewardThreshold(c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT u.id, u.username, u.phone, u.referral_rewarded_at,
+            COUNT(r.id) AS invites
+     FROM users u
+     JOIN referrals r ON r.referrer_user_id = u.id
+     GROUP BY u.id
+     HAVING invites >= ?
+     ORDER BY invites DESC, u.id LIMIT 200`
+  ).bind(threshold).all<Record<string, any>>();
+
+  return c.json({
+    threshold,
+    referrers: rows.results.map((r) => ({
+      userId: r.id,
+      username: r.username ?? "Giver",
+      phone: r.phone,
+      invites: r.invites,
+      rewardedAt: r.referral_rewarded_at ?? null,
+      qualified: !r.referral_rewarded_at,
+    })),
+  });
+});
+
+/** Get or change the referral reward threshold. */
+app.get("/api/admin/referral-threshold", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  return c.json({ threshold: await referralRewardThreshold(c.env) });
+});
+
+app.put("/api/admin/referral-threshold", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const { threshold } = await c.req.json();
+  const n = Math.round(Number(threshold ?? 0));
+  if (!Number.isFinite(n) || n < 1 || n > 1000) {
+    return c.json({ error: "Threshold must be between 1 and 1000" }, 400);
+  }
+  await c.env.DB.prepare(
+    `INSERT INTO admin_settings (key, value) VALUES ('referral_reward_threshold', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).bind(String(n)).run();
+  return c.json({ threshold: n });
+});
+
+/** Reward a qualified referrer (marks them rewarded and notifies them). */
+app.post("/api/admin/referrals/:id/reward", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const user = await c.env.DB.prepare(
+    "SELECT * FROM users WHERE id = ?"
+  ).bind(c.req.param("id")).first<Record<string, any>>();
+  if (!user) return c.json({ error: "User not found" }, 404);
+  if (user.referral_rewarded_at) {
+    return c.json({ error: "This referrer was already rewarded" }, 400);
+  }
+
+  const count = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM referrals WHERE referrer_user_id = ?"
+  ).bind(user.id).first<{ n: number }>())?.n ?? 0;
+  const threshold = await referralRewardThreshold(c.env);
+  if (count < threshold) {
+    return c.json({ error: `Referrer needs ${threshold} referrals, has ${count}` }, 400);
+  }
+
+  await c.env.DB.prepare(
+    "UPDATE users SET referral_rewarded_at = datetime('now', '+2 hours') WHERE id = ?"
+  ).bind(user.id).run();
+
+  const msg = `Congratulations! You reached ${count} referrals and qualified for your Kingdom Sponsor reward. Check your notifications for details.`;
+  await pushToUser(c.env, user.id, "Referral reward earned", msg, { type: "referral_rewarded" })
+    .catch((e) => console.error("referral reward push failed:", e));
+  if (user.phone) {
+    await smsIfNoPush(c.env, user.id, user.phone, msg);
+  }
+
+  return c.json({ rewarded: true, userId: user.id, total: count });
+});
+
 // ---------- Lipila webhook (async confirmations + payout results) ----------
 
 const _enc = new TextEncoder();
@@ -3215,12 +4135,20 @@ app.post("/api/webhooks/lipila", async (c) => {
     await confirmRefund(c.env, referenceId);
   } else if (referenceId.startsWith("PRO-") && (status.includes("success") || status.includes("complete"))) {
     await confirmPromotion(c.env, referenceId);
+  } else if (referenceId.startsWith("AIR-") && (status.includes("success") || status.includes("complete"))) {
+    await confirmAirtimePayment(c.env, referenceId);
+  } else if (referenceId.startsWith("AIR-") && (status.includes("fail") || status.includes("cancel"))) {
+    await failAirtimePayment(c.env, referenceId);
   } else if (isDisbursement && (status.includes("success") || status.includes("complete"))) {
     if (referenceId.startsWith("SET-") || referenceId.startsWith("SWEEP-")) {
       await confirmFeeSweep(c.env, referenceId);
     } else {
       await confirmWithdrawal(c.env, referenceId);
     }
+  } else if (isDisbursement && (status.includes("fail") || status.includes("cancel") || status.includes("reject"))) {
+    const reason = String(body.message ?? body.error ?? `Lipila reported status: ${body.status}`).slice(0, 500);
+    await c.env.DB.prepare("UPDATE withdrawals SET status = 'failed', error = ? WHERE lipila_reference = ? AND status = 'pending'")
+      .bind(reason, referenceId).run();
   } else if (isCollection && (status.includes("success") || status.includes("complete"))) {
     await confirmContribution(c.env, referenceId);
   } else if (isCollection && (status.includes("fail") || status.includes("cancel"))) {
@@ -3311,7 +4239,7 @@ app.get("/api/host/me", async (c) => {
 
   const payouts = await c.env.DB.prepare(
     `SELECT w.id, w.campaign_id, c.title AS campaign_title, w.amount_cents, w.disbursement_fee_cents,
-            w.platform_fee_cents, w.status, w.lipila_reference, w.created_at
+            w.platform_fee_cents, w.status, w.lipila_reference, w.error, w.created_at
      FROM withdrawals w JOIN campaigns c ON c.id = w.campaign_id
      WHERE c.host_user_id = ? ORDER BY w.created_at DESC LIMIT 100`
   ).bind(user.sub).all<Record<string, any>>();
@@ -3351,6 +4279,7 @@ app.get("/api/host/me", async (c) => {
       disbursementFeeCents: w.disbursement_fee_cents,
       platformFeeCents: w.platform_fee_cents,
       status: w.status,
+      error: w.error ?? null,
       reference: w.lipila_reference,
       date: w.created_at,
     })),
@@ -3414,6 +4343,14 @@ app.post("/api/campaigns/:id/withdraw", async (c) => {
   ).bind(campaign.id).first<{ n: number }>())?.n ?? 0;
   if (recentPayouts >= 2) return c.json({ error: "Too many payout requests. Wait a moment and try again." }, 429);
 
+  // Idempotency: never start a second payout while one is still in flight.
+  const inFlight = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM withdrawals WHERE campaign_id = ? AND status IN ('pending','processing')"
+  ).bind(campaign.id).first<{ n: number }>())?.n ?? 0;
+  if (inFlight > 0) {
+    return c.json({ error: "A payout for this campaign is already being processed." }, 409);
+  }
+
   const payoutCents = await createWithdrawal(c.env, campaign.id);
   const available = await availableBalance(c.env, campaign.id);
   return c.json({
@@ -3470,8 +4407,9 @@ app.post("/api/campaigns/:id/end", async (c) => {
        AND (co.donor_user_id IS NULL OR NOT EXISTS (
          SELECT 1 FROM device_tokens dt WHERE dt.user_id = co.donor_user_id))`
   ).bind(campaign.id).all<{ phone: string }>();
+  const endedShareLink = await createShortLink(c.env, `${c.env.APP_URL}/share/${campaign.id}`);
   for (const row of smsPhones.results) {
-    await sendSms(c.env, row.phone, campaignEndedSms(campaign.title, raised, supporters))
+    await sendSms(c.env, row.phone, campaignEndedSms(campaign.title, raised, supporters, endedShareLink))
       .catch((e) => console.error("campaign end sms failed:", e));
   }
 
@@ -3486,12 +4424,40 @@ async function requireAdmin(c: any): Promise<TokenPayload | null> {
   return user;
 }
 
+const ASSISTANT_SCOPES = [
+  "campaigns", "donations", "tickets", "users", "settings", "finance", "restore",
+] as const;
+
+/** Loads an assistant's permission scopes (comma-separated) as a Set. */
+async function assistantScopes(env: Bindings, userId: number): Promise<Set<string>> {
+  const row = await env.DB.prepare(
+    "SELECT permissions FROM admin_assistants WHERE user_id = ?"
+  ).bind(userId).first<{ permissions: string }>();
+  if (!row) return new Set();
+  return new Set(row.permissions.split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+/**
+ * Auth for admin-staff operations. Superadmins always pass. Assistants pass
+ * only when they hold every requested scope. Returns the user or null.
+ */
+async function requireStaff(c: any, ...scopes: string[]): Promise<TokenPayload | null> {
+  const user = await authUser(c);
+  if (!user) return null;
+  if (isAdminPhone(c.env, user.phone)) return user;
+  const allowed = await assistantScopes(c.env, user.sub);
+  if (scopes.every((s) => allowed.has(s))) return user;
+  return null;
+}
+
 app.get("/api/admin/applications", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
 
   const rows = await c.env.DB.prepare(
-    `SELECT id, phone, username, host_status, host_org, host_role, host_reason, host_rejection, created_at
+    `SELECT id, phone, username, host_status, host_org, host_role, host_reason, host_rejection,
+            host_verified, host_verification_notes, host_kyc_status, host_kyc_type,
+            host_kyc_doc_url, host_kyc_notes, created_at
      FROM users WHERE host_status != 'none' ORDER BY
        CASE host_status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC`
   ).all<Record<string, any>>();
@@ -3506,6 +4472,12 @@ app.get("/api/admin/applications", async (c) => {
       role: u.host_role,
       reason: u.host_reason,
       rejection: u.host_rejection,
+      hostVerified: !!u.host_verified,
+      hostVerificationNotes: u.host_verification_notes ?? null,
+      kycStatus: u.host_kyc_status ?? "none",
+      kycType: u.host_kyc_type ?? null,
+      kycDocUrl: u.host_kyc_doc_url ?? null,
+      kycNotes: u.host_kyc_notes ?? null,
       appliedAt: u.created_at,
     })),
   });
@@ -3532,6 +4504,61 @@ app.post("/api/admin/applications/:id/reject", async (c) => {
     "UPDATE users SET host_status = 'rejected', is_host = 0, host_rejection = ? WHERE id = ?"
   ).bind(reason, c.req.param("id")).run();
   return c.json({ ok: true });
+});
+
+// Admin: mark a host as independently verified + attach private notes.
+app.post("/api/admin/hosts/:id/verify", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  const verified = body.verified !== false;
+  const notes = String(body.notes ?? "").trim().slice(0, 1000) || null;
+  const res = await c.env.DB.prepare(
+    "UPDATE users SET host_verified = ?, host_verification_notes = ? WHERE id = ? AND host_status = 'approved'"
+  ).bind(verified ? 1 : 0, notes, c.req.param("id")).run();
+  if ((res.meta?.changes ?? 0) === 0) return c.json({ error: "Approved host not found" }, 404);
+  await logAdminAction(c.env, admin.sub, "host_verify", "user", c.req.param("id"),
+    `${verified ? "Verified" : "Un-verified"} host: ${notes ?? "no notes"}`);
+  const user = await c.env.DB.prepare("SELECT phone, username FROM users WHERE id = ?")
+    .bind(c.req.param("id")).first<{ phone: string; username: string }>();
+  if (user?.phone) {
+    await pushToUser(c.env, Number(c.req.param("id")),
+      verified ? "You're a verified host" : "Host verification updated",
+      verified
+        ? "Great news! The administrator has independently verified your host account."
+        : "Your host verification was updated by the administrator.",
+      { type: "host_verified" }).catch((e) => console.error("host verify push failed:", e));
+  }
+  return c.json({ ok: true, verified, notes });
+});
+
+// Admin: approve or reject a host's KYC submission. Approving also flips the
+// public verified badge on; rejecting keeps it off until resubmitted.
+app.post("/api/admin/hosts/:id/kyc", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  const approve = body.approve === true;
+  const notes = String(body.notes ?? "").trim().slice(0, 500) || null;
+
+  const res = await c.env.DB.prepare(
+    "UPDATE users SET host_kyc_status = ?, host_kyc_notes = ?, host_verified = ? WHERE id = ?"
+  ).bind(approve ? "approved" : "rejected", notes, approve ? 1 : 0, c.req.param("id")).run();
+  if ((res.meta?.changes ?? 0) === 0) return c.json({ error: "User not found" }, 404);
+  await logAdminAction(c.env, admin.sub, "host_kyc", "user", c.req.param("id"),
+    `${approve ? "Approved" : "Rejected"} KYC${notes ? ` — ${notes}` : ""}`);
+
+  const user = await c.env.DB.prepare("SELECT phone, username FROM users WHERE id = ?")
+    .bind(c.req.param("id")).first<{ phone: string; username: string }>();
+  if (user?.phone) {
+    await pushToUser(c.env, Number(c.req.param("id")),
+      approve ? "You're a verified host" : "Host verification updated",
+      approve
+        ? "Great news! Your identity document was approved — your campaigns now show the verified badge."
+        : `Your host verification was not approved.${notes ? ` Reason: ${notes}` : ""}`,
+      { type: "host_verified" }).catch((e) => console.error("kyc push failed:", e));
+  }
+  return c.json({ ok: true, kycStatus: approve ? "approved" : "rejected" });
 });
 
 app.get("/api/admin/promotions", async (c) => {
@@ -3572,6 +4599,51 @@ app.post("/api/admin/promotions/:id/approve", async (c) => {
 
   await approvePromotion(c.env, id);
   return c.json({ ok: true, message: "Promotion approved and now live." });
+});
+
+// ---------- admin: promote a campaign directly (free, no approval needed) ----------
+
+app.post("/api/admin/campaigns/:id/promote", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const campaign = await c.env.DB.prepare(
+    "SELECT * FROM campaigns WHERE id = ? AND status != 'deleted'"
+  ).bind(c.req.param("id")).first<Record<string, any>>();
+  if (!campaign) return c.json({ error: "Campaign not found" }, 404);
+  if (campaign.promoted) return c.json({ error: "This campaign is already promoted." }, 400);
+  if (await activePromotionCount(c.env) >= PROMO_SLOTS) {
+    return c.json({ error: "All promotion slots are taken. End or un-promote one first." }, 409);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  let days = Math.round(Number(body.days));
+  if (!Number.isFinite(days) || days < 1 || days > 30) days = await promoDays(c.env);
+  const until = new Date(Date.now() + days * 86400000).toISOString();
+
+  const referenceId = `ADMIN-${campaign.id}-${Date.now()}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "INSERT INTO promotions (campaign_id, amount_cents, days, lipila_reference, status, expires_at) VALUES (?, 0, ?, ?, 'active', ?)"
+    ).bind(campaign.id, days, referenceId, until),
+    c.env.DB.prepare(
+      "UPDATE campaigns SET promoted = 1, promoted_until = ? WHERE id = ?"
+    ).bind(until, campaign.id),
+  ]);
+
+  const host = await c.env.DB.prepare(
+    "SELECT u.phone, u.id AS user_id FROM users u WHERE u.id = ?"
+  ).bind(campaign.host_user_id).first<{ phone: string; user_id: number }>();
+  if (host) {
+    const adminPromoShareLink = await createShortLink(c.env, `${c.env.APP_URL}/share/${campaign.id}`);
+    await smsIfNoPush(c.env, host.user_id, host.phone, promotionActiveSms(campaign.title, days, until.slice(0, 10), adminPromoShareLink));
+    await pushToUser(c.env, host.user_id, "Your campaign is promoted",
+      `"${campaign.title}" is now at the top of Kingdom Sponsor for ${days} days.`,
+      { type: "promotion_active", campaignId: String(campaign.id) })
+      .catch((e) => console.error("admin promo push failed:", e));
+  }
+
+  return c.json({ ok: true, days, until, message: `"${campaign.title}" is promoted to the top for ${days} days.` });
 });
 
 app.post("/api/admin/promotions/:id/reject", async (c) => {
@@ -3637,6 +4709,7 @@ app.get("/api/admin/payouts", async (c) => {
       platformFeeCents: w.platform_fee_cents,
       status: w.status,
       lipilaReference: w.lipila_reference,
+      error: w.error ?? null,
       createdAt: w.created_at,
     })),
   });
@@ -3658,6 +4731,11 @@ app.get("/api/admin/stats", async (c) => {
   const activeCampaigns = (await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM campaigns WHERE status = 'active'"
   ).first<{ n: number }>()) ?? { n: 0 };
+  const activeRaised = (await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(co.amount_cents),0) AS s
+     FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
+     WHERE co.status = 'confirmed' AND cam.status = 'active'`
+  ).first<{ s: number }>()) ?? { s: 0 };
   const pending = (await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM users WHERE host_status = 'pending'"
   ).first<{ n: number }>()) ?? { n: 0 };
@@ -3724,9 +4802,35 @@ app.get("/api/admin/stats", async (c) => {
     "SELECT COALESCE(SUM(amount_cents),0) AS s FROM fee_sweeps WHERE status = 'success'"
   ).first<{ s: number }>())?.s ?? 0;
 
+  const refThreshold = await referralRewardThreshold(c.env);
+  const qualifiedReferrers = (await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM (
+       SELECT u.id FROM users u
+       JOIN referrals r ON r.referrer_user_id = u.id
+       WHERE u.referral_rewarded_at IS NULL
+       GROUP BY u.id HAVING COUNT(r.id) >= ?
+     )`
+  ).bind(refThreshold).first<{ n: number }>())?.n ?? 0;
+
+  // Total money processed through the platform: confirmed donations + paid-out
+  // withdrawals + settled fee sweeps (gross flow, before fees).
+  const payoutsTotal = (await c.env.DB.prepare(
+    "SELECT COALESCE(SUM(amount_cents),0) AS s FROM withdrawals WHERE status = 'success'"
+  ).first<{ s: number }>())?.s ?? 0;
+  const totalProcessedCents = total.s + payoutsTotal + feeSettled;
+
+  const assistantsCount = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM admin_assistants"
+  ).first<{ n: number }>())?.n ?? 0;
+
+  const pendingEditRequests = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM campaign_edit_requests WHERE status = 'pending'"
+  ).first<{ n: number }>())?.n ?? 0;
+
   return c.json({
     stats: {
       totalRaisedCents: total.s,
+      totalActiveRaisedCents: activeRaised.s,
       confirmedDonations: total.n,
       donors: total.d,
       platformFeesCents: platformFees.s + payoutPlatformFees.s,
@@ -3750,6 +4854,10 @@ app.get("/api/admin/stats", async (c) => {
       activePledges: pledgesRow.n ?? 0,
       openTickets: ticketsRow.n ?? 0,
       pendingDeleteRequests: deleteReqsRow.n ?? 0,
+      qualifiedReferrers,
+      totalProcessedCents,
+      assistants: assistantsCount,
+      pendingEditRequests,
     },
     topCampaigns: topList,
     topDonors: topDonors.results.map((d) => ({
@@ -3768,6 +4876,160 @@ app.get("/api/admin/stats", async (c) => {
       campaignTitle: r.campaign_title,
       date: r.created_at,
     })),
+  });
+});
+
+// ---------- admin exports (CSV + PDF) ----------
+
+function csvCell(v: unknown): string {
+  if (v == null) return "";
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function csvRow(cells: unknown[]): string {
+  return cells.map(csvCell).join(",");
+}
+
+/** Admin: export the stats snapshot + full transaction ledger as CSV. */
+app.get("/api/admin/stats/export.csv", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const stats = (await c.env.DB.prepare(
+    `SELECT
+       (SELECT COALESCE(SUM(amount_cents),0) FROM contributions WHERE status = 'confirmed') AS donations_cents,
+       (SELECT COALESCE(SUM(amount_cents),0) FROM contributions WHERE status = 'confirmed' AND campaign_id IN (SELECT id FROM campaigns WHERE status = 'active')) AS active_cents,
+       (SELECT COUNT(*) FROM contributions WHERE status = 'confirmed') AS donations,
+       (SELECT COUNT(DISTINCT donor_user_id) FROM contributions WHERE status = 'confirmed') AS donors,
+       (SELECT COALESCE(SUM(platform_fee_cents),0) FROM contributions WHERE status = 'confirmed') AS fees_cents,
+       (SELECT COUNT(*) FROM users) AS users,
+       (SELECT COUNT(*) FROM campaigns WHERE status != 'deleted') AS campaigns,
+       (SELECT COALESCE(SUM(amount_cents),0) FROM withdrawals WHERE status = 'success') AS payouts_cents,
+       (SELECT COALESCE(SUM(amount_cents),0) FROM fee_sweeps WHERE status = 'success') AS sweeps_cents`
+  ).first<Record<string, number>>()) ?? {};
+
+  const lines: string[] = [];
+  lines.push(csvRow(["Kingdom Sponsor stats export", new Date().toISOString()]));
+  lines.push(csvRow([]));
+  lines.push(csvRow(["Metric", "Value"]));
+  lines.push(csvRow(["Total raised (all time, ZMW)", ((stats.donations_cents ?? 0) / 100).toFixed(2)]));
+  lines.push(csvRow(["Total raised (active campaigns, ZMW)", ((stats.active_cents ?? 0) / 100).toFixed(2)]));
+  lines.push(csvRow(["Confirmed donations", stats.donations ?? 0]));
+  lines.push(csvRow(["Distinct donors", stats.donors ?? 0]));
+  lines.push(csvRow(["Platform fees earned (ZMW)", ((stats.fees_cents ?? 0) / 100).toFixed(2)]));
+  lines.push(csvRow(["Payouts sent (ZMW)", ((stats.payouts_cents ?? 0) / 100).toFixed(2)]));
+  lines.push(csvRow(["Fee sweeps settled (ZMW)", ((stats.sweeps_cents ?? 0) / 100).toFixed(2)]));
+  lines.push(csvRow(["Total processed (ZMW)", (((stats.donations_cents ?? 0) + (stats.payouts_cents ?? 0) + (stats.sweeps_cents ?? 0)) / 100).toFixed(2)]));
+  lines.push(csvRow(["Users", stats.users ?? 0]));
+  lines.push(csvRow(["Campaigns", stats.campaigns ?? 0]));
+  lines.push(csvRow([]));
+  lines.push(csvRow(["Transaction ledger"]));
+  lines.push(csvRow(["id", "campaignId", "campaignTitle", "donor", "phone", "amountCents", "platformFeeCents", "lipilaFeeCents", "status", "confirmedAt", "createdAt"]));
+
+  const tx = await c.env.DB.prepare(
+    `SELECT co.id, co.campaign_id, cam.title AS campaign_title, co.donor_name, co.is_anonymous,
+            co.phone, co.amount_cents, co.platform_fee_cents, co.lipila_fee_cents,
+            co.status, co.confirmed_at, co.created_at
+     FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
+     ORDER BY co.id DESC LIMIT 5000`
+  ).all<Record<string, any>>();
+  for (const t of tx.results) {
+    lines.push(csvRow([
+      t.id, t.campaign_id, t.campaign_title,
+      t.is_anonymous ? "Anonymous" : (t.donor_name ?? ""),
+      t.phone, t.amount_cents, t.platform_fee_cents, t.lipila_fee_cents,
+      t.status, t.confirmed_at, t.created_at,
+    ]));
+  }
+
+  return new Response(lines.join("\r\n"), {
+    status: 200,
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="kingdom-sponsor-stats-${new Date().toISOString().slice(0, 10)}.csv"`,
+      "Cache-Control": "no-store",
+    },
+  });
+});
+
+/** Admin: downloadable PDF stats report (uses the same pdf-lib we use for receipts). */
+app.get("/api/admin/stats/export.pdf", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const stats = (await c.env.DB.prepare(
+    `SELECT
+       (SELECT COALESCE(SUM(amount_cents),0) FROM contributions WHERE status = 'confirmed') AS donations_cents,
+       (SELECT COUNT(*) FROM contributions WHERE status = 'confirmed') AS donations,
+       (SELECT COUNT(DISTINCT donor_user_id) FROM contributions WHERE status = 'confirmed') AS donors,
+       (SELECT COALESCE(SUM(platform_fee_cents),0) FROM contributions WHERE status = 'confirmed') AS fees_cents,
+       (SELECT COUNT(*) FROM users) AS users,
+       (SELECT COUNT(*) FROM campaigns WHERE status != 'deleted') AS campaigns,
+       (SELECT COALESCE(SUM(amount_cents),0) FROM withdrawals WHERE status = 'success') AS payouts_cents,
+       (SELECT COALESCE(SUM(amount_cents),0) FROM fee_sweeps WHERE status = 'success') AS sweeps_cents`
+  ).first<Record<string, number>>()) ?? {};
+  const topCamps = await c.env.DB.prepare(
+    `SELECT c.title, COALESCE(SUM(co.amount_cents),0) AS raised, COUNT(co.id) AS n
+     FROM campaigns c LEFT JOIN contributions co ON co.campaign_id = c.id AND co.status = 'confirmed'
+     WHERE c.status != 'deleted' GROUP BY c.id ORDER BY raised DESC LIMIT 10`
+  ).all<Record<string, any>>();
+
+  const doc = await PDFDocument.create();
+  const page = doc.addPage();
+  const { width, height } = page.getSize();
+  const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const gold = rgb(0.78, 0.59, 0.12);
+  const dark = rgb(0.1, 0.12, 0.16);
+  const muted = rgb(0.45, 0.48, 0.52);
+
+  let y = height - 60;
+  page.drawText("Kingdom Sponsor", { x: 50, y, size: 20, font: bold, color: gold });
+  y -= 22;
+  page.drawText("Platform stats report", { x: 50, y, size: 12, font, color: muted });
+  y -= 14;
+  page.drawText(`Generated ${new Date().toLocaleDateString("en-ZM", { year: "numeric", month: "long", day: "numeric" })}`, { x: 50, y, size: 10, font, color: muted });
+  y -= 30;
+  page.drawRectangle({ x: 50, y: y - 4, width: width - 100, height: 1, color: gold });
+
+  const rows: [string, string][] = [
+    ["Total raised (all time)", `ZMW ${((stats.donations_cents ?? 0) / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2 })}`],
+    ["Confirmed donations", String(stats.donations ?? 0)],
+    ["Distinct donors", String(stats.donors ?? 0)],
+    ["Platform fees earned", `ZMW ${((stats.fees_cents ?? 0) / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2 })}`],
+    ["Payouts sent", `ZMW ${((stats.payouts_cents ?? 0) / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2 })}`],
+    ["Fee sweeps settled", `ZMW ${((stats.sweeps_cents ?? 0) / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2 })}`],
+    ["Total processed", `ZMW ${(((stats.donations_cents ?? 0) + (stats.payouts_cents ?? 0) + (stats.sweeps_cents ?? 0)) / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2 })}`],
+    ["Users", String(stats.users ?? 0)],
+    ["Campaigns", String(stats.campaigns ?? 0)],
+  ];
+  for (const [label, value] of rows) {
+    page.drawText(label, { x: 50, y, size: 11, font, color: dark });
+    page.drawText(value, { x: 300, y, size: 11, font: bold, color: dark });
+    y -= 22;
+  }
+
+  y -= 10;
+  page.drawText("Top campaigns", { x: 50, y, size: 13, font: bold, color: gold });
+  y -= 18;
+  for (const c of topCamps.results) {
+    if (y < 70) break;
+    page.drawText(String(c.title ?? "").slice(0, 40), { x: 50, y, size: 10, font, color: dark });
+    page.drawText(`ZMW ${(c.raised / 100).toLocaleString("en-ZM", { minimumFractionDigits: 2 })} (${c.n} gifts)`, { x: 300, y, size: 10, font: bold, color: dark });
+    y -= 16;
+  }
+
+  y -= 20;
+  page.drawText("This report is generated automatically for the Kingdom Sponsor admin.", { x: 50, y, size: 8, font, color: muted });
+
+  return new Response(await doc.save(), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="kingdom-sponsor-stats-${new Date().toISOString().slice(0, 10)}.pdf"`,
+      "Cache-Control": "no-store",
+    },
   });
 });
 
@@ -3864,7 +5126,7 @@ app.get("/api/admin/disbursements", async (c) => {
       kind: "payout" as const,
       id: `w-${w.id}`,
       campaignId: w.campaign_id,
-      campaignTitle: w.campaign_title ?? "—",
+      campaignTitle: w.campaign_title ?? "â€”",
       amountCents: w.amount_cents,
       lipilaFeeCents: w.disbursement_fee_cents,
       platformFeeCents: w.platform_fee_cents,
@@ -3889,7 +5151,133 @@ app.get("/api/admin/disbursements", async (c) => {
   return c.json({ disbursements: out });
 });
 
+// ---------- Lipila diagnostic endpoint ----------
+app.get("/api/admin/lipila-diagnostic", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const env = c.env;
+  const results: Record<string, any> = {
+    lipilaEnv: env.LIPILA_ENV,
+    baseUrl: lipilaBase(env),
+    apiKeyPrefix: env.LIPILA_API_KEY ? env.LIPILA_API_KEY.slice(0, 4) + "..." : "NOT SET",
+  };
+
+  // Get our outbound IP (for whitelisting in Lipila dashboard)
+  try {
+    const ipRes = await fetch("https://ifconfig.me/ip");
+    results.outboundIp = (await ipRes.text()).trim();
+  } catch {
+    results.outboundIpError = "Could not determine outbound IP";
+  }
+
+  // Test 1: Wallet balance (tests API key + base URL)
+  try {
+    const bal = await getWalletBalance(env);
+    results.walletBalance = bal;
+    results.walletBalanceOk = true;
+  } catch (e) {
+    results.walletBalanceError = e instanceof Error ? e.message : String(e);
+    results.walletBalanceOk = false;
+  }
+
+  // Test 2: Disbursement status check (tests auth against disbursement endpoint)
+  try {
+    const testRef = `DIAG-${Date.now()}`;
+    const url = `${lipilaBase(env)}/disbursements/check-status?referenceId=${testRef}`;
+    const res = await fetch(url, {
+      headers: { accept: "application/json", "x-api-key": env.LIPILA_API_KEY },
+    });
+    const rawText = await res.text().catch(() => "");
+    results.disbursementStatusCheck = {
+      status: res.status,
+      body: rawText.slice(0, 300),
+      ok: res.ok,
+    };
+  } catch (e) {
+    results.disbursementStatusCheckError = e instanceof Error ? e.message : String(e);
+  }
+
+  // Test 3: Check recent withdrawals
+  const recent = await env.DB.prepare(
+    "SELECT status, COUNT(*) as cnt FROM withdrawals GROUP BY status"
+  ).all<{ status: string; cnt: number }>();
+  results.withdrawalStats = recent.results;
+
+  return c.json(results);
+});
+
+app.get("/api/admin/lipila-logs", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const kind = c.req.query("kind");     // collection | disbursement | all (default all)
+  const status = c.req.query("status"); // pending | success | failed | error
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "200", 10) || 200, 1), 1000);
+
+  const params: string[] = [];
+  const binds: any[] = [];
+  let where = "WHERE 1=1";
+  if (kind && ["collection", "disbursement"].includes(kind)) {
+    where += ` AND kind = ?`;
+    binds.push(kind);
+  }
+  if (status) {
+    where += ` AND status = ?`;
+    binds.push(status);
+  }
+  const sql = `SELECT kind, reference_id AS referenceId, phone, amount_cents AS amountCents,
+                      status, lipila_status AS lipilaStatus, message, created_at AS createdAt, updated_at AS updatedAt
+               FROM lipila_logs ${where} ORDER BY created_at DESC LIMIT ?`;
+  const out = await c.env.DB.prepare(sql).bind(...binds, limit).all<Record<string, any>>();
+  return c.json({ logs: out.results.map((r) => ({
+    kind: r.kind, referenceId: r.reference_id, phone: r.phone,
+    amountCents: r.amount_cents, status: r.status, lipilaStatus: r.lipila_status,
+    message: r.message, createdAt: r.created_at, updatedAt: r.updated_at,
+  })) });
+});
+
 // ---------- Superadmin manual disbursement trigger ----------
+
+// ---------- Admin: campaigns eligible for payout ----------
+
+app.get("/api/admin/eligible-payouts", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+
+  const DEFAULT_MIN_WITHDRAW = 20000;
+  const cfg = loadFeeConfig(c.env);
+  const rows = await c.env.DB.prepare(
+    `SELECT c.id, c.title, c.host_user_id, u.phone AS hostPhone,
+            c.min_withdraw_cents AS minWithdrawCents
+     FROM campaigns c JOIN users u ON u.id = c.host_user_id
+     WHERE c.status = 'active'`
+  ).all<Record<string, any>>();
+
+  const eligible: Record<string, any>[] = [];
+  for (const row of rows.results) {
+    const available = await availableBalance(c.env, row.id);
+    const minW = row.minWithdrawCents ?? DEFAULT_MIN_WITHDRAW;
+    if (available < minW) continue;
+    const payoutCents = payoutAmountCents(available, cfg);
+    const lipilaFee = disbursementFeeCents(available, cfg);
+    const platformFee = platformDisbursementFeeCents(available, cfg);
+    if (payoutCents <= 0) continue;
+    eligible.push({
+      id: row.id,
+      title: row.title,
+      hostPhone: row.hostPhone,
+      availableCents: available,
+      minWithdrawCents: minW,
+      payoutCents,
+      lipilaFeeCents: lipilaFee,
+      platformFeeCents: platformFee,
+    });
+  }
+  return c.json({ campaigns: eligible });
+});
+
+// ---------- Admin: disburse a specific campaign ----------
 
 app.post("/api/admin/disburse", async (c) => {
   const admin = await requireAdmin(c);
@@ -3917,8 +5305,8 @@ app.post("/api/admin/test-push", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const userId = Number(body.userId) || admin.sub;
 
-  await pushToUser(c.env, userId, "Kingdom Sponsor Test", "This is a test push notification from the admin dashboard.", { type: "test" });
-  return c.json({ ok: true, message: "Test push sent to user " + userId });
+  const sent = await pushToUser(c.env, userId, "Kingdom Sponsor Test", "This is a test push notification from the admin dashboard.", { type: "test" });
+  return c.json({ ok: true, message: `Test push sent (delivered to ${sent} device${sent === 1 ? "" : "s"})`, sent });
 });
 
 // ---------- Lipila wallet balance (superadmin) ----------
@@ -3927,10 +5315,13 @@ app.get("/api/admin/wallet-balance", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
   try {
-    const balanceCents = await getWalletBalance(c.env as LipilaEnv);
-    return c.json({ balanceCents, balanceKwacha: balanceCents / 100 });
+    const balanceKwacha = await getWalletBalance(c.env as LipilaEnv);
+    const balanceCents = Math.round(balanceKwacha * 100);
+    return c.json({ ok: true, balanceCents, balanceKwacha });
   } catch (e) {
-    return c.json({ balanceCents: 0, balanceKwacha: 0 });
+    const reason = (e instanceof Error ? e.message : String(e)).slice(0, 300);
+    console.error("wallet-balance failed:", e);
+    return c.json({ ok: false, balanceCents: 0, balanceKwacha: 0, error: reason });
   }
 });
 
@@ -3947,24 +5338,122 @@ app.post("/api/admin/withdraw", async (c) => {
   const referenceId = `ADMIN-WITHDRAW-${Date.now()}`;
   const cleanPhone = phone.replace("+", "").replace(/\s/g, "");
   try {
-    const result = await createDisbursement(c.env, {
-      referenceId, amountCents, accountNumber: cleanPhone,
-      narration: "Kingdom Sponsor admin withdrawal",
-      callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
-    });
-    await c.env.DB.prepare(
-      "INSERT INTO fee_sweeps (kind, amount_cents, lipila_reference, status) VALUES (?, ?, ?, 'pending')"
-    ).bind("admin_withdraw", amountCents, referenceId).run();
-    return c.json({ ok: true, referenceId, identifier: result.identifier, message: `Withdrawal of K${(amountCents / 100).toLocaleString()} initiated to ${phone}` });
-  } catch (e) {
-    return c.json({ error: `Withdrawal failed: ${e}` }, 500);
+     const result = await createDisbursement(c.env, {
+       referenceId, amountCents, accountNumber: cleanPhone,
+       narration: "Kingdom Sponsor admin withdrawal",
+       callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
+     }, c.env.DB);
+     await c.env.DB.prepare(
+       "INSERT INTO fee_sweeps (kind, amount_cents, lipila_reference, status) VALUES (?, ?, ?, 'pending')"
+     ).bind("admin_withdraw", amountCents, referenceId).run();
+     // Immediately check Lipila status so pending doesn't get stuck
+     try {
+       const statusRes = await checkDisbursementStatus(c.env, referenceId);
+       const lipilaStatus = (statusRes.status ?? "").toLowerCase();
+       if (["successful", "success", "complete"].includes(lipilaStatus)) {
+         await c.env.DB.prepare("UPDATE fee_sweeps SET status = 'success' WHERE lipila_reference = ?").bind(referenceId).run();
+       } else if (["failed", "error"].includes(lipilaStatus)) {
+         await c.env.DB.prepare("UPDATE fee_sweeps SET status = 'failed' WHERE lipila_reference = ?").bind(referenceId).run();
+       }
+     } catch (_) { /* status check is best-effort */ }
+     return c.json({ ok: true, referenceId, identifier: result.identifier, message: `Withdrawal of K${(amountCents / 100).toLocaleString()} initiated to ${phone}` });
+   } catch (e) {
+     const msg = e instanceof Error ? e.message : String(e);
+     await logLipilaEvent(c.env.DB, "disbursement", referenceId, phone, amountCents, msg);
+     return c.json({ error: `Withdrawal failed: ${e}` }, 500);
+   }
+});
+
+// ---------- admin assistants (limited admin roles) ----------
+
+app.get("/api/admin/assistants", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const rows = await c.env.DB.prepare(
+    `SELECT a.user_id, a.permissions, a.added_by, a.created_at, u.phone, u.username, u.host_status
+     FROM admin_assistants a JOIN users u ON u.id = a.user_id ORDER BY a.created_at DESC`
+  ).all<Record<string, any>>();
+  return c.json({
+    assistants: rows.results.map((r) => ({
+      userId: r.user_id,
+      phone: r.phone,
+      username: r.username ?? "Giver",
+      hostStatus: r.host_status,
+      permissions: (String(r.permissions ?? "")).split(",").map((s: string) => s.trim()).filter(Boolean),
+      addedBy: r.added_by,
+      createdAt: r.created_at,
+    })),
+  });
+});
+
+/** Search users by phone or username for adding assistants (superadmin only). */
+app.get("/api/admin/users/search", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const q = String(c.req.query("q") ?? "").trim().slice(0, 50);
+  if (!q) return c.json({ users: [] });
+  const like = `%${q}%`;
+  const rows = await c.env.DB.prepare(
+    `SELECT id, phone, username, host_status FROM users
+     WHERE phone LIKE ? OR username LIKE ? ORDER BY created_at DESC LIMIT 20`
+  ).bind(like, like).all<Record<string, any>>();
+  return c.json({
+    users: rows.results.map((u) => ({
+      id: u.id,
+      phone: u.phone,
+      username: u.username ?? "Giver",
+      hostStatus: u.host_status,
+    })),
+  });
+});
+
+app.post("/api/admin/assistants", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const userId = Math.round(Number(body.userId) || 0);
+  if (!userId) return c.json({ error: "A user is required" }, 400);
+  const permissions = Array.isArray(body.permissions)
+    ? body.permissions.map((p: string) => String(p).trim()).filter((p: string) => (ASSISTANT_SCOPES as readonly string[]).includes(p))
+    : [];
+  if (permissions.length === 0) return c.json({ error: "Pick at least one permission" }, 400);
+  if (isAdminPhone(c.env, String(body.phone ?? ""))) {
+    return c.json({ error: "That phone belongs to a superadmin — already has full access." }, 400);
   }
+  await c.env.DB.prepare(
+    "INSERT INTO admin_assistants (user_id, permissions, added_by) VALUES (?, ?, ?) " +
+    "ON CONFLICT(user_id) DO UPDATE SET permissions = excluded.permissions, added_by = excluded.added_by"
+  ).bind(userId, permissions.join(","), admin.sub).run();
+  return c.json({ ok: true });
+});
+
+app.put("/api/admin/assistants/:userId", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const userId = Number(c.req.param("userId"));
+  const body = await c.req.json();
+  const permissions = Array.isArray(body.permissions)
+    ? body.permissions.map((p: string) => String(p).trim()).filter((p: string) => (ASSISTANT_SCOPES as readonly string[]).includes(p))
+    : [];
+  if (permissions.length === 0) return c.json({ error: "Pick at least one permission" }, 400);
+  const res = await c.env.DB.prepare(
+    "UPDATE admin_assistants SET permissions = ? WHERE user_id = ?"
+  ).bind(permissions.join(","), userId).run();
+  if ((res.meta?.changes ?? 0) === 0) return c.json({ error: "Assistant not found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.delete("/api/admin/assistants/:userId", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  await c.env.DB.prepare("DELETE FROM admin_assistants WHERE user_id = ?")
+    .bind(c.req.param("userId")).run();
+  return c.json({ ok: true });
 });
 
 app.get("/api/admin/campaigns", async (c) => {
   const admin = await requireAdmin(c);
   if (!admin) return c.json({ error: "Admin only" }, 403);
-
   const rows = await c.env.DB.prepare(
     `SELECT cam.*, u.username AS host_username FROM campaigns cam
      JOIN users u ON u.id = cam.host_user_id ORDER BY cam.created_at DESC`
@@ -3991,13 +5480,19 @@ const LOGO_TYPES: Record<string, string> = {
 app.get("/media/:key{.+}", async (c) => {
   const key = c.req.param("key");
   if (!/^[a-zA-Z0-9/_.-]+$/.test(key)) return c.json({ error: "Not found" }, 404);
+  // KYC documents are private — only admins can view them.
+  if (key.startsWith("kyc/")) {
+    const admin = await requireAdmin(c);
+    if (!admin) return c.json({ error: "Not found" }, 404);
+  }
   const obj = await c.env.MEDIA.get(key);
   if (!obj) return c.json({ error: "Not found" }, 404);
   const ext = key.split(".").pop()?.toLowerCase();
   const contentType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+  const cache = key.startsWith("kyc/") ? "private, no-store" : "public, max-age=86400, immutable";
   const headers = new Headers({
     "Content-Type": contentType,
-    "Cache-Control": "public, max-age=86400, immutable",
+    "Cache-Control": cache,
   });
   return new Response(obj.body, { headers });
 });
@@ -4025,6 +5520,33 @@ app.post("/api/me/avatar", async (c) => {
 
   return c.json({ ok: true, avatarUrl });
 });
+
+/** Host KYC document upload (NRC / NGO cert / endorsement). Stored privately in
+ *  R2 under `kyc/` so only admins can view it; URL is saved on the user. */
+app.post("/api/host/kyc-upload", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "Upload a document image" }, 400);
+
+  const type = file.type.toLowerCase();
+  const ext = LOGO_TYPES[type];
+  if (!ext) return c.json({ error: "Document must be PNG, JPG or WebP" }, 400);
+  if (file.size > 5_000_000) return c.json({ error: "Document must be under 5 MB" }, 400);
+
+  const key = `kyc/${user.sub}-${Date.now()}.${ext}`;
+  await c.env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: type } });
+  const docUrl = `${c.env.APP_URL}/media/${key}`;
+  await c.env.DB.prepare("UPDATE users SET host_kyc_doc_url = ? WHERE id = ?")
+    .bind(docUrl, user.sub).run();
+
+  return c.json({ ok: true, docUrl });
+});
+
+/** Admin: view a host's KYC document. Only reachable through the /media/ route
+ *  which requires admin auth for the `kyc/` prefix (see media handler). */
 
 app.post("/api/campaigns/:id/logo", async (c) => {
   const user = await authUser(c);
@@ -4077,39 +5599,36 @@ app.get("/share/:id", async (c) => {
   if (!campaign) return c.json({ error: "Campaign not found" }, 404);
 
   const longUrl = c.env.APP_URL + "/share/" + id;
-  await c.env.DB.prepare(
-    "INSERT INTO short_links (long_url, short_url, clicks) VALUES (?, ?, 0) " +
-    "ON CONFLICT(long_url) DO UPDATE SET clicks = short_links.clicks + 1"
-  ).bind(longUrl, longUrl).run();
+  await createShortLink(c.env, longUrl);
 
   const pub = await campaignPublic(c.env, campaign);
   const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : "";
   const pageUrl = c.env.APP_URL + "/share/" + id + refQuery;
-  const wa = "https://wa.me/?text=" + encodeURIComponent(pub.title + " - " + pub.blurb + "\nGive here: " + pageUrl);
+  const waMessage = pub.title + "\n" + pub.blurb +
+    "\n" + formatKwacha(pub.raisedCents) + " raised" +
+    (pub.hostName ? " \u00b7 " + pub.hostName : "") +
+    "\n\nGive here: " + pageUrl;
+  const wa = "https://wa.me/?text=" + encodeURIComponent(waMessage);
   const goalLine = pub.hasGoal
     ? "<div class=\"amt\">" + formatKwacha(pub.raisedCents) + " raised of " + formatKwacha(pub.goalCents) + "</div>"
     : "<div class=\"amt\">" + formatKwacha(pub.raisedCents) + " raised</div>";
   const endsLine = pub.endsAt ? "ends " + new Date(pub.endsAt).toLocaleDateString() : "";
   const ogImage = pub.imageUrl ? "<meta property=\"og:image\" content=\"" + pub.imageUrl + "\">" : "";
-  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta property=\"og:title\" content=\"" + pub.title + "\"><meta property=\"og:description\" content=\"" + pub.blurb + "\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:url\" content=\"" + pageUrl + "\">" + ogImage + "<meta name=\"theme-color\" content=\"#1d4ed8\"><title>" + pub.title + " - Kingdom Sponsor</title><style>" + SHARE_STYLE + "</style></head><body><div class=\"card\">" + (pub.imageUrl ? "<img src=\"" + pub.imageUrl + "\" alt=\"\" style=\"width:96px;height:96px;border-radius:16px;margin-bottom:12px;object-fit:cover\">" : "") + "<h1>" + pub.title + "</h1><p>" + pub.blurb + "</p>" + goalLine + "<a class=\"btn\" href=\"" + wa + "\" target=\"_blank\">Share on WhatsApp</a><a class=\"btn2\" href=\"kingdomsponsor://campaign/" + id + (refQuery ? "&ref=" + encodeURIComponent(ref) : "") + "\">Open in app</a><a class=\"btn3\" href=\"https://play.google.com/store/apps/details?id=com.kingdomsponsor.app\" target=\"_blank\">Don't have the app? Get it on Play Store</a><div class=\"foot\">" + (pub.donorCount ?? 0) + " givers - " + endsLine + "</div></div></body></html>";
+  const verifiedBadge = pub.hostVerified
+    ? "<span style=\"display:inline-block;background:#1d4ed8;color:#fff;font-size:11px;font-weight:700;border-radius:12px;padding:3px 10px;margin-bottom:8px\">\u2713 Verified host</span>"
+    : "";
+  const hostLine = pub.hostName
+    ? "<div style=\"color:#94a3b8;font-size:12px;margin-bottom:8px\">Hosted by " + pub.hostName + (pub.hostVerified ? " \u00b7 verified" : "") + "</div>"
+    : "";
+  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta property=\"og:title\" content=\"" + pub.title + "\"><meta property=\"og:description\" content=\"" + pub.blurb + "\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:url\" content=\"" + pageUrl + "\">" + ogImage + "<meta name=\"theme-color\" content=\"#1d4ed8\"><title>" + pub.title + " - Kingdom Sponsor</title><style>" + SHARE_STYLE + "</style></head><body><div class=\"card\">" + (pub.imageUrl ? "<img src=\"" + pub.imageUrl + "\" alt=\"\" style=\"width:96px;height:96px;border-radius:16px;margin-bottom:12px;object-fit:cover\">" : "") + "<h1>" + pub.title + "</h1>" + verifiedBadge + hostLine + "<p>" + pub.blurb + "</p>" + goalLine + "<a class=\"btn\" href=\"" + wa + "\" target=\"_blank\">Share on WhatsApp</a><a class=\"btn2\" href=\"kingdomsponsor://campaign/" + id + (ref ? "?ref=" + encodeURIComponent(ref) : "") + "\">Open in app</a><a class=\"btn3\" href=\"https://play.google.com/store/apps/details?id=com.kingdomsponsor.app\" target=\"_blank\">Don't have the app? Get it on Play Store</a><div class=\"foot\">" + (pub.donorCount ?? 0) + " givers - " + endsLine + "</div></div></body></html>";
   return c.html(html);
 });
 
 // Short-link redirect: increments click count and 302-redirects to the long URL.
 app.get("/go/:code", async (c) => {
-  const code = c.req.param("code");
-  const row = await c.env.DB.prepare(
-    "SELECT long_url FROM short_links WHERE short_url = ?"
-  )
-    .bind(`${c.env.APP_URL}/go/${code}`)
-    .first<{ long_url: string }>();
-  if (!row) return c.json({ error: "Link not found" }, 404);
-  await c.env.DB.prepare(
-    "UPDATE short_links SET clicks = clicks + 1 WHERE short_url = ?"
-  )
-    .bind(`${c.env.APP_URL}/go/${code}`)
-    .run();
-  return c.redirect(row.long_url, 302);
+  const longUrl = await resolveShortLink(c.env, c.req.param("code"));
+  if (!longUrl) return c.json({ error: "Link not found" }, 404);
+  return c.redirect(longUrl, 302);
 });
 
 // Lightweight widget for embedding a campaign on any website (use as <iframe src=".../share/:id/embed">).
@@ -4126,7 +5645,7 @@ app.get("/share/:id/embed", async (c) => {
 app.get("/share", async (c) => {
   const ref = String(c.req.query("ref") ?? "").trim().toUpperCase().slice(0, 12);
   const top = await c.env.DB.prepare(
-    "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 5"
+    "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY created_at DESC LIMIT 5"
   ).all<{ id: number; title: string }>();
   const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : "";
   const rows = top.results.map((t) => `<a class="btn2" href="${c.env.APP_URL}/share/${t.id}${refQuery}">${t.title}</a>`).join("");
@@ -4147,7 +5666,7 @@ app.post("/api/ussd", async (c) => {
 
   async function topCampaigns() {
     return (await c.env.DB.prepare(
-      "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 10"
+      "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY created_at DESC LIMIT 10"
     ).all<{ id: number; title: string }>()).results;
   }
 
@@ -4165,7 +5684,7 @@ app.post("/api/ussd", async (c) => {
         accountNumber: phone.replace("+", ""),
         narration: `Kingdom Sponsor donation to ${campaign.title}`,
         callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
-      });
+      }, c.env.DB);
       await c.env.DB.prepare("UPDATE contributions SET lipila_identifier = ? WHERE id = ?")
         .bind(result.identifier, row.id).run();
       return true;
@@ -4189,11 +5708,13 @@ app.post("/api/ussd", async (c) => {
   }
 
   if (level === 1 && choice === "3") {
-    return c.text("END Share the Kingdom Sponsor app link: https://kingdom-sponsor.app. Copy the link and send it to your family and friends via WhatsApp.");
+    const appShareLink = await createShortLink(c.env, c.env.APP_URL);
+    return c.text(`END Share the Kingdom Sponsor app: ${appShareLink}. Copy the link and send it to your family and friends via WhatsApp.`);
   }
 
   if (level === 1 && choice === "4") {
-    return c.text("END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit https://kingdom-sponsor.app to get the download link.");
+    const appShareLink = await createShortLink(c.env, c.env.APP_URL);
+    return c.text(`END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit ${appShareLink} to get the download link.`);
   }
 
   const mainMenuText = "CON Kingdom Sponsor\n1. View campaigns\n2. Scan QR code\n3. Share event\n4. Download app\n0. Exit";
@@ -4205,8 +5726,6 @@ app.post("/api/ussd", async (c) => {
   }
 
   const scanText = "END Open your phone camera or WhatsApp and scan the QR code on the Kingdom Sponsor poster or flyer to access the fundraiser.";
-  const shareText = "END Share the Kingdom Sponsor app link: https://kingdom-sponsor.app. Copy the link and send it to your family and friends via WhatsApp.";
-  const downloadText = "END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit https://kingdom-sponsor.app to get the download link.";
 
   async function makeContribution(campaignId: number, amountCents: number): Promise<boolean> {
     const fees = donationFees(amountCents, loadFeeConfig(c.env));
@@ -4237,8 +5756,16 @@ app.post("/api/ussd", async (c) => {
 
   if (level === 3 && parts[1] === "0") {
     if (choice === "2") return c.text(scanText);
-    if (choice === "3") return c.text(shareText);
-    if (choice === "4") return c.text(downloadText);
+    if (choice === "3") {
+      const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ? AND status = 'active'").bind(parts[0]).first<Record<string, any>>();
+      if (!campaign) return c.text("END Invalid selection.");
+      const campaignShareLink = await createShortLink(c.env, `${c.env.APP_URL}/share/${campaign.id}`);
+      return c.text(`END Share this fundraiser: ${campaignShareLink}. Copy the link and send it to your family and friends via WhatsApp.`);
+    }
+    if (choice === "4") {
+      const appShareLink = await createShortLink(c.env, c.env.APP_URL);
+      return c.text(`END Download Kingdom Sponsor from Google Play Store. Search for 'Kingdom Sponsor' or visit ${appShareLink} to get the download link.`);
+    }
     if (choice === "0") return c.text("END Thank you for using Kingdom Sponsor. Goodbye!");
     return c.text(await campaignListText());
   }
@@ -4343,7 +5870,7 @@ app.get("/links/:id/accept", async (c) => {
   if (!row) return c.text("This link request is no longer pending.", 410);
 
   const deepLink = `kingdomsponsor://accept-link/${linkId}`;
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Accept link — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:420px;margin:0 auto;text-align:center}h1{font-size:22px;margin:0 0 12px;color:#34d399}p{color:#94a3b8;line-height:1.5}a.btn{display:block;background:#25D366;color:#06281b;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:12px 0}a.btn2{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:12px 0}</style></head><body><h1>Accept account link?</h1><p>${row.sender_username ?? "Someone"} wants to link their account to yours as ${row.link_type}.</p><a class="btn" href="${deepLink}">Open in app to accept</a><a class="btn2" href="https://play.google.com/store/apps/details?id=com.kingdomsponsor.app">Don't have the app? Get it on Play Store</a></body></html>`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Accept link â€” Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:420px;margin:0 auto;text-align:center}h1{font-size:22px;margin:0 0 12px;color:#34d399}p{color:#94a3b8;line-height:1.5}a.btn{display:block;background:#25D366;color:#06281b;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:12px 0}a.btn2{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:12px 0}</style></head><body><h1>Accept account link?</h1><p>${row.sender_username ?? "Someone"} wants to link their account to yours as ${row.link_type}.</p><a class="btn" href="${deepLink}">Open in app to accept</a><a class="btn2" href="https://play.google.com/store/apps/details?id=com.kingdomsponsor.app">Don't have the app? Get it on Play Store</a></body></html>`;
   return c.html(html);
 });
 
@@ -4358,17 +5885,17 @@ app.get("/links/:id/reject", async (c) => {
   if (!row) return c.text("This link request is no longer pending.", 410);
 
   const deepLink = `kingdomsponsor://reject-link/${linkId}`;
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Decline link — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:420px;margin:0 auto;text-align:center}h1{font-size:22px;margin:0 0 12px;color:#34d399}p{color:#94a3b8;line-height:1.5}a.btn{display:block;background:#ef4444;color:#fff;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:12px 0}a.btn2{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:12px 0}</style></head><body><h1>Decline account link?</h1><p>Decline the link request from ${row.sender_username ?? "someone"}.</p><a class="btn" href="${deepLink}">Open in app to decline</a><a class="btn2" href="https://play.google.com/store/apps/details?id=com.kingdomsponsor.app">Don't have the app? Get it on Play Store</a></body></html>`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Decline link â€” Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:420px;margin:0 auto;text-align:center}h1{font-size:22px;margin:0 0 12px;color:#34d399}p{color:#94a3b8;line-height:1.5}a.btn{display:block;background:#ef4444;color:#fff;font-weight:700;text-decoration:none;padding:14px;border-radius:10px;margin:12px 0}a.btn2{display:block;background:#334155;color:#cbd5e1;font-weight:700;text-decoration:none;padding:12px;border-radius:10px;margin:12px 0}</style></head><body><h1>Decline account link?</h1><p>Decline the link request from ${row.sender_username ?? "someone"}.</p><a class="btn" href="${deepLink}">Open in app to decline</a><a class="btn2" href="https://play.google.com/store/apps/details?id=com.kingdomsponsor.app">Don't have the app? Get it on Play Store</a></body></html>`;
   return c.html(html);
 });
 
 app.get("/privacy", (c) => {
-  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Privacy Policy — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:800px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Privacy Policy</h1><p><strong>Last updated:</strong> August 2026</p><p>Kingdom Sponsor (\"we,\" \"our,\" or \"us\") operates a fundraising platform that allows users to donate to campaigns and hosts to create and manage fundraising campaigns. This privacy policy describes how we collect, use, and protect your personal data.</p><h2>1. Information We Collect</h2><h3>1.1 Account Data</h3><ul><li><strong>Phone number</strong> — required for registration and OTP-based authentication via Africa's Talking SMS</li><li><strong>Username</strong> — chosen during registration</li><li><strong>User ID</strong> — internally generated identifier</li></ul><h3>1.2 Donation Data</h3><ul><li><strong>Amount donated</strong> (in ngwee/cents)</li><li><strong>Donor name</strong> (optional, can be anonymous)</li><li><strong>Phone number</strong> — used for Lipila payment prompts and SMS notifications</li><li><strong>Transaction reference ID</strong> — unique identifier for each donation</li><li><strong>Campaign ID</strong> — the campaign being supported</li></ul><h3>1.3 Campaign Data</h3><ul><li><strong>Campaign title, description, and goal</strong></li><li><strong>Campaign status</strong> (active, draft, ended)</li><li><strong>Logo URL</strong> (if uploaded by the host)</li><li><strong>Sponsor count and amounts</strong></li></ul><h3>1.4 Payment Data</h3><ul><li><strong>Lipila collection and disbursement references</strong></li><li><strong>Payment status</strong> (pending, success, failed, cancelled)</li><li><strong>Platform fees and Lipila fees</strong> (calculated automatically)</li></ul><h3>1.5 USSD Session Data</h3><ul><li><strong>Session ID</strong> — temporary identifier for USSD interactions</li><li><strong>Phone number</strong> — the user's phone dialing the USSD code</li><li><strong>Menu selections</strong> — choices made during the USSD flow</li><li><strong>Donation amount and reference</strong> — recorded when a USSD donation is confirmed</li></ul><h3>1.6 Technical Data</h3><ul><li><strong>IP address</strong> — logged automatically by Cloudflare</li><li><strong>User agent and device information</strong> — collected by the Flutter app</li><li><strong>FCM tokens</strong> — used for push notifications (stored per device)</li></ul><h2>2. How We Use Your Data</h2><ul><li><strong>Authentication</strong> — your phone number is used to send and verify OTPs via Africa's Talking SMS</li><li><strong>Payment processing</strong> — donation amounts and phone numbers are sent to Lipila for mobile money transactions</li><li><strong>SMS notifications</strong> — we send transaction confirmations and pledge reminders via Africa's Talking</li><li><strong>USSD interactions</strong> — your USSD session data is processed in real time to provide the interactive menu experience</li><li><strong>Campaign management</strong> — campaign data is displayed publicly (except donor phone numbers, which are never exposed)</li><li><strong>Analytics and reporting</strong> — aggregated, anonymised data is used for platform statistics and admin dashboards</li><li><strong>Fee calculation</strong> — platform fees and Lipila fees are calculated and deducted automatically from each transaction</li></ul><h2>3. Data Storage</h2><ul><li>All data is stored in <strong>Cloudflare D1</strong> (SQLite) databases</li><li>Media files (campaign logos) are stored in <strong>Cloudflare R2</strong></li><li>No data is stored on our own servers — all infrastructure is provided by Cloudflare</li></ul><h2>4. Data Retention</h2><ul><li><strong>Contributions and transactions</strong> — retained indefinitely for financial records</li><li><strong>USSD session data</strong> — not persisted; processed in real time and discarded after the session ends</li><li><strong>User accounts</strong> — retained until the account is deleted</li><li><strong>Campaigns</strong> — retained until the host ends the campaign</li><li><strong>Payout/withdrawal records</strong> — retained indefinitely</li></ul><h2>5. Data Sharing</h2><p>We do not sell your personal data. We share data only with:</p><ul><li><strong>Lipila</strong> — for payment processing (phone number, amount, reference ID)</li><li><strong>Africa's Talking</strong> — for SMS and USSD services (phone number, session data)</li><li><strong>Cloudflare</strong> — as our infrastructure provider (IP address, technical data)</li><li><strong>Firebase</strong> — for FCM push notifications (device tokens)</li></ul><h2>6. Your Rights</h2><p>You have the right to:</p><ul><li><strong>Access</strong> — request a copy of your personal data</li><li><strong>Rectification</strong> — correct inaccurate information</li><li><strong>Erasure</strong> — request deletion of your account and associated data</li><li><strong>Portability</strong> — receive your data in a machine-readable format</li><li><strong>Object</strong> — object to processing of your data for direct marketing</li></ul><p>To exercise any of these rights, contact us through the platform or reach out to the superadmin.</p><h2>7. Security</h2><ul><li>All API endpoints are protected by JWT authentication</li><li>Phone numbers are never exposed publicly</li><li>Payment data is processed by Lipila and never stored in full</li><li>USSD session data is processed in real time and not persisted</li><li>We use HTTPS for all data transmission</li></ul><h2>8. Children's Privacy</h2><p>Kingdom Sponsor is not intended for users under the age of 13. We do not knowingly collect data from children.</p><h2>9. Changes to This Policy</h2><p>We may update this privacy policy from time to time. Changes will be posted on this page with a new \"Last updated\" date.</p><h2>10. Contact</h2><p>For privacy-related inquiries, contact the platform administrator or the superadmin phone number configured in the backend.</p><p><strong>Platform:</strong> Kingdom Sponsor<br><strong>Backend:</strong> https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev<br><strong>GitHub:</strong> https://github.com/Carpso/chisomo</p></body></html>";
+  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Privacy Policy â€” Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:800px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Privacy Policy</h1><p><strong>Last updated:</strong> August 2026</p><p>Kingdom Sponsor (\"we,\" \"our,\" or \"us\") operates a fundraising platform that allows users to donate to campaigns and hosts to create and manage fundraising campaigns. This privacy policy describes how we collect, use, and protect your personal data.</p><h2>1. Information We Collect</h2><h3>1.1 Account Data</h3><ul><li><strong>Phone number</strong> â€” required for registration and OTP-based authentication via Africa's Talking SMS</li><li><strong>Username</strong> â€” chosen during registration</li><li><strong>User ID</strong> â€” internally generated identifier</li></ul><h3>1.2 Donation Data</h3><ul><li><strong>Amount donated</strong> (in ngwee/cents)</li><li><strong>Donor name</strong> (optional, can be anonymous)</li><li><strong>Phone number</strong> â€” used for Lipila payment prompts and SMS notifications</li><li><strong>Transaction reference ID</strong> â€” unique identifier for each donation</li><li><strong>Campaign ID</strong> â€” the campaign being supported</li></ul><h3>1.3 Campaign Data</h3><ul><li><strong>Campaign title, description, and goal</strong></li><li><strong>Campaign status</strong> (active, draft, ended)</li><li><strong>Logo URL</strong> (if uploaded by the host)</li><li><strong>Sponsor count and amounts</strong></li></ul><h3>1.4 Payment Data</h3><ul><li><strong>Lipila collection and disbursement references</strong></li><li><strong>Payment status</strong> (pending, success, failed, cancelled)</li><li><strong>Platform fees and Lipila fees</strong> (calculated automatically)</li></ul><h3>1.5 USSD Session Data</h3><ul><li><strong>Session ID</strong> â€” temporary identifier for USSD interactions</li><li><strong>Phone number</strong> â€” the user's phone dialing the USSD code</li><li><strong>Menu selections</strong> â€” choices made during the USSD flow</li><li><strong>Donation amount and reference</strong> â€” recorded when a USSD donation is confirmed</li></ul><h3>1.6 Technical Data</h3><ul><li><strong>IP address</strong> â€” logged automatically by Cloudflare</li><li><strong>User agent and device information</strong> â€” collected by the Flutter app</li><li><strong>FCM tokens</strong> â€” used for push notifications (stored per device)</li></ul><h2>2. How We Use Your Data</h2><ul><li><strong>Authentication</strong> â€” your phone number is used to send and verify OTPs via Africa's Talking SMS</li><li><strong>Payment processing</strong> â€” donation amounts and phone numbers are sent to Lipila for mobile money transactions</li><li><strong>SMS notifications</strong> â€” we send transaction confirmations and pledge reminders via Africa's Talking</li><li><strong>USSD interactions</strong> â€” your USSD session data is processed in real time to provide the interactive menu experience</li><li><strong>Campaign management</strong> â€” campaign data is displayed publicly (except donor phone numbers, which are never exposed)</li><li><strong>Analytics and reporting</strong> â€” aggregated, anonymised data is used for platform statistics and admin dashboards</li><li><strong>Fee calculation</strong> â€” platform fees and Lipila fees are calculated and deducted automatically from each transaction</li></ul><h2>3. Data Storage</h2><ul><li>All data is stored in <strong>Cloudflare D1</strong> (SQLite) databases</li><li>Media files (campaign logos) are stored in <strong>Cloudflare R2</strong></li><li>No data is stored on our own servers â€” all infrastructure is provided by Cloudflare</li></ul><h2>4. Data Retention</h2><ul><li><strong>Contributions and transactions</strong> â€” retained indefinitely for financial records</li><li><strong>USSD session data</strong> â€” not persisted; processed in real time and discarded after the session ends</li><li><strong>User accounts</strong> â€” retained until the account is deleted</li><li><strong>Campaigns</strong> â€” retained until the host ends the campaign</li><li><strong>Payout/withdrawal records</strong> â€” retained indefinitely</li></ul><h2>5. Data Sharing</h2><p>We do not sell your personal data. We share data only with:</p><ul><li><strong>Lipila</strong> â€” for payment processing (phone number, amount, reference ID)</li><li><strong>Africa's Talking</strong> â€” for SMS and USSD services (phone number, session data)</li><li><strong>Cloudflare</strong> â€” as our infrastructure provider (IP address, technical data)</li><li><strong>Firebase</strong> â€” for FCM push notifications (device tokens)</li></ul><h2>6. Your Rights</h2><p>You have the right to:</p><ul><li><strong>Access</strong> â€” request a copy of your personal data</li><li><strong>Rectification</strong> â€” correct inaccurate information</li><li><strong>Erasure</strong> â€” request deletion of your account and associated data</li><li><strong>Portability</strong> â€” receive your data in a machine-readable format</li><li><strong>Object</strong> â€” object to processing of your data for direct marketing</li></ul><p>To exercise any of these rights, contact us through the platform or reach out to the superadmin.</p><h2>7. Security</h2><ul><li>All API endpoints are protected by JWT authentication</li><li>Phone numbers are never exposed publicly</li><li>Payment data is processed by Lipila and never stored in full</li><li>USSD session data is processed in real time and not persisted</li><li>We use HTTPS for all data transmission</li></ul><h2>8. Children's Privacy</h2><p>Kingdom Sponsor is not intended for users under the age of 13. We do not knowingly collect data from children.</p><h2>9. Changes to This Policy</h2><p>We may update this privacy policy from time to time. Changes will be posted on this page with a new \"Last updated\" date.</p><h2>10. Contact</h2><p>For privacy-related inquiries, contact the platform administrator or the superadmin phone number configured in the backend.</p><p><strong>Platform:</strong> Kingdom Sponsor<br><strong>Backend:</strong> https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev<br><strong>GitHub:</strong> https://github.com/Carpso/chisomo</p></body></html>";
   return c.html(html);
 });
 
 app.get("/delete-account", (c) => {
-  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete Account — Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:600px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Delete Account</h1><h2>Kingdom Sponsor</h2><p><strong>In the app:</strong> open the app, tap the settings icon, then \"Delete account\". Your account and personal data are deleted immediately.</p><p><strong>By email:</strong> email <strong>support@kingdom-sponsor.app</strong> with the subject \"Delete Account\" and the phone number associated with your account. Requests are processed within 30 days.</p><h2>Data Deleted</h2><ul><li>Username and profile information</li><li>Pledge records</li><li>User links</li><li>FCM device tokens</li><li>Donor name and identity on contributions</li></ul><h2>Data Retained</h2><ul><li>Transaction records (required for financial compliance) — retained for 7 years</li><li>Anonymized analytics — retained indefinitely</li><li>Audit logs — retained for 1 year</li></ul><p>If you simply want to stop receiving SMS notifications, you can reply STOP to any SMS from us.</p></body></html>";
+  const html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete Account â€” Kingdom Sponsor</title><style>body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;padding:24px;max-width:600px;margin:0 auto;line-height:1.6}h1{font-size:24px;margin:0 0 16px;color:#34d399}h2{font-size:18px;margin:24px 0 8px;color:#94a3b8}p{margin:0 0 12px}ul{margin:0 0 12px;padding-left:20px}li{margin:4px 0}a{color:#34d399}</style></head><body><h1>Delete Account</h1><h2>Kingdom Sponsor</h2><p><strong>In the app:</strong> open the app, tap the settings icon, then \"Delete account\". Your account and personal data are deleted immediately.</p><p><strong>By email:</strong> email <strong>support@kingdom-sponsor.app</strong> with the subject \"Delete Account\" and the phone number associated with your account. Requests are processed within 30 days.</p><h2>Data Deleted</h2><ul><li>Username and profile information</li><li>Pledge records</li><li>User links</li><li>FCM device tokens</li><li>Donor name and identity on contributions</li></ul><h2>Data Retained</h2><ul><li>Transaction records (required for financial compliance) â€” retained for 7 years</li><li>Anonymized analytics â€” retained indefinitely</li><li>Audit logs â€” retained for 1 year</li></ul><p>If you simply want to stop receiving SMS notifications, you can reply STOP to any SMS from us.</p></body></html>";
   return c.html(html);
 });
 
@@ -4433,18 +5960,23 @@ const appObject = Sentry.withSentry(
   {
     fetch: app.fetch,
     scheduled: async (controller: ScheduledController, env: Bindings, ctx: ExecutionContext) => {
-      // 15-minute cron: intruder alert scan only.
+      // 15-minute cron: intruder alert scan, MNO health check, + auto-disburse.
       if (controller.cron === "*/15 * * * *") {
         ctx.waitUntil(runIntruderAlerts(env));
+        ctx.waitUntil(refreshMnoHealth(env));
+        ctx.waitUntil(runAutoDisburse(env));
         return;
       }
       // Daily cron: all scheduled jobs.
       ctx.waitUntil(runFeeSweep(env));
+      ctx.waitUntil(runFeeSweepStatusChecks(env));
       ctx.waitUntil(runPledgeReminders(env));
       ctx.waitUntil(runPromotionExpiry(env));
       ctx.waitUntil(runAutoDisburse(env));
       ctx.waitUntil(runWithdrawalStatusChecks(env));
       ctx.waitUntil(runTicketAutoClose(env));
+      ctx.waitUntil(runAirtimeFulfillment(env));
+      ctx.waitUntil(runCampaignEndingAlerts(env));
     },
   }
 );
@@ -4476,7 +6008,7 @@ app.post("/api/ussd/callback", async (c) => {
       case "1":
         response = "CON Choose campaign:\n";
         const rows = await c.env.DB.prepare(
-          "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC LIMIT 5"
+          "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY promoted DESC, created_at DESC LIMIT 5"
         ).all<{ id: number; title: string }>();
         for (let i = 0; i < rows.results.length; i++) {
           response += `${i + 1}. ${rows.results[i].title}\n`;
@@ -4509,7 +6041,7 @@ app.post("/api/ussd/callback", async (c) => {
     const choice = parseInt(text, 10);
     if (choice >= 1) {
       const rows = await c.env.DB.prepare(
-        "SELECT id, title FROM campaigns WHERE status = 'active' ORDER BY promoted DESC, created_at DESC LIMIT 5"
+        "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY promoted DESC, created_at DESC LIMIT 5"
       ).all<{ id: number; title: string }>();
       if (rows.results[choice - 1]) {
         session.data.campaignId = String(rows.results[choice - 1].id);
@@ -4661,15 +6193,26 @@ app.get("/api/airtime/config", async (c) => {
   const markup = await getSetting(c.env, "airtime_markup_pct");
   const minAmount = await getSetting(c.env, "airtime_min_amount_cents");
   const maxAmount = await getSetting(c.env, "airtime_max_amount_cents");
+  const bonusPct = Number(await getSetting(c.env, "airtime_bonus_pct")) || 5;
+  const user = await authUser(c);
+  let creditsCents = 0;
+  if (user) {
+    const row = await c.env.DB.prepare("SELECT airtime_credits_cents FROM users WHERE id = ?")
+      .bind(user.sub).first<{ airtime_credits_cents: number }>();
+    creditsCents = Number(row?.airtime_credits_cents) || 0;
+  }
   return c.json({
     enabled: enabled === "true",
     markupPct: Number(markup) || 5,
     minAmountCents: Number(minAmount) || 500,
     maxAmountCents: Number(maxAmount) || 50000,
+    bonusPct,
+    creditsCents,
   });
 });
 
-// Create airtime order
+// Create airtime order (payment collected via Lipila MoMo prompt, then
+// fulfilled through Africa's Talking airtime API by the webhook/cron).
 app.post("/api/airtime/order", async (c) => {
   const user = await authUser(c);
   if (!user) return c.json({ error: "Not authenticated" }, 401);
@@ -4683,7 +6226,7 @@ app.post("/api/airtime/order", async (c) => {
   const amountCents = Math.round(Number(body.amountCents) || 0);
 
   if (!phone || phone.length < 10) return c.json({ error: "Valid phone required" }, 400);
-  if (!["airtel", "mtn", "zamtel"].includes(network)) return c.json({ error: "Invalid network" }, 400);
+  if (!["airtel", "mtn", "zamtel", "zedmobile"].includes(network)) return c.json({ error: "Invalid network" }, 400);
 
   const minAmount = Number(await getSetting(c.env, "airtime_min_amount_cents")) || 500;
   const maxAmount = Number(await getSetting(c.env, "airtime_max_amount_cents")) || 50000;
@@ -4692,22 +6235,224 @@ app.post("/api/airtime/order", async (c) => {
   }
 
   const markupPct = Number(await getSetting(c.env, "airtime_markup_pct")) || 5;
-  const costCents = Math.round(amountCents * (1 + markupPct / 100));
+  let costCents = Math.round(amountCents * (1 + markupPct / 100));
 
+  // Optional: apply accumulated airtime bonus credits towards this order.
+  const balanceRow = await c.env.DB.prepare(
+    "SELECT airtime_credits_cents FROM users WHERE id = ?"
+  ).bind(user.sub).first<{ airtime_credits_cents: number }>();
+  const balanceCents = Number(balanceRow?.airtime_credits_cents) || 0;
+  const useCreditsCents = Math.max(0, Math.round(Number(body.useCreditsCents) || 0));
+  const creditsUsed = Math.min(useCreditsCents, balanceCents, costCents);
+  costCents -= creditsUsed;
+  if (costCents <= 0) return c.json({ error: "Amount is fully covered by credits â€” enter an amount above your credits." }, 400);
+
+  const referenceId = `AIR-${user.sub}-${Date.now()}`;
   const r = await c.env.DB.prepare(
-    "INSERT INTO airtime_orders (user_id, phone, network, amount_cents, cost_cents, status) VALUES (?, ?, ?, ?, ?, 'pending')"
-  ).bind(user.sub, phone, network, amountCents, costCents).run();
+    `INSERT INTO airtime_orders (user_id, phone, network, amount_cents, cost_cents, lipila_reference, credits_used_cents, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+  ).bind(user.sub, phone, network, amountCents, costCents, referenceId, creditsUsed).run();
+  const orderId = r.meta?.last_row_id;
+
+  if (creditsUsed > 0) {
+    // Atomic decrement: never spend more than the user holds, even if two
+    // orders race in (prevents negative credit balances).
+    await c.env.DB.prepare(
+      "UPDATE users SET airtime_credits_cents = airtime_credits_cents - ? WHERE id = ? AND airtime_credits_cents >= ?"
+    ).bind(creditsUsed, user.sub, creditsUsed).run();
+  }
+
+  // Collect the order cost via a mobile-money prompt (same flow as donations).
+  try {
+    await createCollection(c.env, {
+      referenceId,
+      amountCents: costCents,
+      accountNumber: user.phone.replace("+", ""),
+      narration: `Kingdom Sponsor airtime order ${orderId}`,
+      callbackUrl: `${c.env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(c.env.LIPILA_WEBHOOK_SECRET)}`,
+    }, c.env.DB);
+  } catch (e) {
+    // Payment could not start: refund any credits used and void the order.
+    if (creditsUsed > 0) {
+      await c.env.DB.prepare(
+        "UPDATE users SET airtime_credits_cents = airtime_credits_cents + ? WHERE id = ?"
+      ).bind(creditsUsed, user.sub).run();
+    }
+    await c.env.DB.prepare(
+      "UPDATE airtime_orders SET status = 'failed', error = ? WHERE id = ?"
+    ).bind(String(e instanceof Error ? e.message : e).slice(0, 500), orderId).run();
+    await logLipilaEvent(c.env.DB, "collection", referenceId, user.phone, costCents, `airtime collection failed: ${e}`);
+    console.error("airtime collection failed:", e);
+    return c.json({ error: "Airtime payment could not be started. Try again." }, 502);
+  }
 
   return c.json({
     ok: true,
-    orderId: r.meta?.last_row_id,
+    orderId,
     phone,
     network,
     amountCents,
     costCents,
-    message: `Airtime order of K${(amountCents / 100).toLocaleString()} to ${phone} received.`,
+    creditsUsed,
+    message: `Check your phone and enter PIN to pay ${formatKwacha(costCents)}. Airtime is delivered right after payment.`,
   });
 });
+
+// ---------- airtime fulfillment ----------
+
+/** Deliver airtime for a paid order via Africa's Talking (real in production).
+ *  Moves the order to `sent` and stores the AT requestId so the AT status
+ *  callback can confirm real MNO delivery the instant it arrives. */
+async function fulfillAirtimeOrder(env: Bindings, orderId: number): Promise<void> {
+  const order = await env.DB.prepare("SELECT * FROM airtime_orders WHERE id = ?")
+    .bind(orderId).first<Record<string, any>>();
+  if (!order || order.status !== "paid") return;
+  try {
+    const res = await sendAirtime(env, order.phone, order.amount_cents / 100);
+    const requestId = String(res?.responses?.[0]?.requestId ?? "").trim();
+    await env.DB.prepare(
+      "UPDATE airtime_orders SET status = 'sent', at_request_id = ?, sent_at = datetime('now', '+2 hours'), completed_at = NULL, error = NULL WHERE id = ?"
+    ).bind(requestId || null, orderId).run();
+    const msg = airtimeSentSms(order.phone, order.amount_cents);
+    await pushToUser(env, order.user_id, "Airtime sent", msg, { type: "airtime_sent" })
+      .catch((e) => console.error("airtime push failed:", e));
+    const user = await env.DB.prepare("SELECT phone FROM users WHERE id = ?")
+      .bind(order.user_id).first<{ phone: string }>();
+    if (user?.phone) await smsIfNoPush(env, order.user_id, user.phone, msg);
+    console.log("[AIRTIME] order", orderId, "sent; requestId =", requestId, JSON.stringify(res).slice(0, 200));
+  } catch (e) {
+    const msg = String(e instanceof Error ? e.message : e).slice(0, 500);
+    await env.DB.prepare(
+      "UPDATE airtime_orders SET attempts = attempts + 1, error = ? WHERE id = ?"
+    ).bind(msg, orderId).run();
+    console.error("[AIRTIME] fulfillment failed for order", orderId, msg);
+  }
+}
+
+/** Africa's Talking airtime STATUS callback — the one that confirms real MNO
+ *  delivery the instant it happens. Matches by the requestId we stored when
+ *  sending, then marks the order delivered or failed and notifies the user. */
+app.post("/api/webhooks/at-airtime/status", async (c) => {
+  // Read the raw body text first (Sentry/buffering-safe) and parse it manually.
+  const raw = await c.req.text().catch(() => "");
+  let body: Record<string, any> = {};
+  if (raw) {
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      // Form-encoded fallback: phoneNumber=...&status=...&requestId=...
+      for (const pair of raw.split("&")) {
+        const [k, v] = pair.split("=");
+        if (k) body[decodeURIComponent(k)] = decodeURIComponent(v ?? "");
+      }
+    }
+  }
+  const requestId = String(body.requestId ?? "").trim();
+  const status = String(body.status ?? "").toLowerCase();
+  const phone = String(body.phoneNumber ?? "");
+  const description = String(body.description ?? "").slice(0, 500);
+
+  if (!requestId) {
+    return c.json({ ok: false, error: "No requestId" }, 400);
+  }
+
+  const order = await c.env.DB.prepare(
+    "SELECT * FROM airtime_orders WHERE at_request_id = ?"
+  ).bind(requestId).first<Record<string, any>>();
+  if (!order) {
+    console.error("[AIRTIME] status callback for unknown requestId:", requestId, status);
+    return c.json({ ok: false, error: "Unknown order" }, 404);
+  }
+
+  if (status.includes("success")) {
+    const res = await c.env.DB.prepare(
+      "UPDATE airtime_orders SET status = 'completed', delivered_at = datetime('now', '+2 hours'), error = NULL WHERE id = ? AND status IN ('sent','paid')"
+    ).bind(order.id).run();
+    if ((res.meta?.changes ?? 0) === 0) return c.json({ ok: true, ignored: true });
+    const msg = airtimeDeliveredSms(order.phone, order.amount_cents);
+    await pushToUser(c.env, order.user_id, "Airtime delivered", msg, { type: "airtime_delivered" })
+      .catch((e) => console.error("airtime delivered push failed:", e));
+    const user = await c.env.DB.prepare("SELECT phone FROM users WHERE id = ?")
+      .bind(order.user_id).first<{ phone: string }>();
+    if (user?.phone) await smsIfNoPush(c.env, order.user_id, user.phone, msg);
+    console.log("[AIRTIME] delivered:", requestId);
+  } else if (status.includes("fail")) {
+    const res = await c.env.DB.prepare(
+      "UPDATE airtime_orders SET status = 'failed', error = ?, completed_at = NULL WHERE id = ? AND status = 'sent'"
+    ).bind(description || "Delivery failed", order.id).run();
+    if ((res.meta?.changes ?? 0) === 0) return c.json({ ok: true, ignored: true });
+    const msg = airtimeFailedSms(order.phone, order.amount_cents);
+    await pushToUser(c.env, order.user_id, "Airtime delivery failed", msg, { type: "airtime_failed" })
+      .catch((e) => console.error("airtime failed push failed:", e));
+    const user = await c.env.DB.prepare("SELECT phone FROM users WHERE id = ?")
+      .bind(order.user_id).first<{ phone: string }>();
+    if (user?.phone) await smsIfNoPush(c.env, order.user_id, user.phone, msg);
+    console.error("[AIRTIME] failed:", requestId, description);
+  }
+
+  return c.json({ ok: true });
+});
+
+/** Lipila webhook: payment for an airtime order succeeded -> mark paid + fulfill. */
+async function confirmAirtimePayment(env: Bindings, referenceId: string): Promise<void> {
+  const order = await env.DB.prepare("SELECT * FROM airtime_orders WHERE lipila_reference = ?")
+    .bind(referenceId).first<Record<string, any>>();
+  if (!order || order.status !== "pending") return;
+  // Idempotency: only the call that flips pending -> paid proceeds, so a
+  // webhook replay can't double-grant bonus credits or double-deliver airtime.
+  const res = await env.DB.prepare("UPDATE airtime_orders SET status = 'paid' WHERE id = ? AND status = 'pending'").bind(order.id).run();
+  if ((res.meta?.changes ?? 0) === 0) return;
+  // Bonus reward: a percentage of the airtime amount back as credits (granted on payment).
+  const bonusPct = Number(await getSetting(env, "airtime_bonus_pct")) || 5;
+  const bonusCents = Math.round(order.amount_cents * (bonusPct / 100));
+  if (bonusCents > 0) {
+    await env.DB.prepare(
+      "UPDATE users SET airtime_credits_cents = airtime_credits_cents + ? WHERE id = ?"
+    ).bind(bonusCents, order.user_id).run();
+  }
+  await fulfillAirtimeOrder(env, order.id);
+}
+
+/** Lipila webhook: payment failed -> refund credits used, void the order. */
+async function failAirtimePayment(env: Bindings, referenceId: string): Promise<void> {
+  const order = await env.DB.prepare("SELECT * FROM airtime_orders WHERE lipila_reference = ?")
+    .bind(referenceId).first<Record<string, any>>();
+  if (!order || order.status !== "pending") return;
+  if (order.credits_used_cents > 0) {
+    await env.DB.prepare(
+      "UPDATE users SET airtime_credits_cents = airtime_credits_cents + ? WHERE id = ?"
+    ).bind(order.credits_used_cents, order.user_id).run();
+  }
+  await env.DB.prepare(
+    "UPDATE airtime_orders SET status = 'failed', error = 'Payment not completed' WHERE id = ?"
+  ).bind(order.id).run();
+}
+
+/** Scheduled: retry paid-but-unsent, stuck-sent, and failed-but-retryable airtime orders. */
+async function runAirtimeFulfillment(env: Bindings): Promise<void> {
+  const paid = await env.DB.prepare(
+    "SELECT id FROM airtime_orders WHERE status = 'paid' AND (error IS NULL OR attempts < 3)"
+  ).all<{ id: number }>();
+  for (const row of paid.results) {
+    await fulfillAirtimeOrder(env, row.id);
+  }
+  // Orders we sent but never got a status callback for (MNO silence) — resend
+  // after 30 minutes; if it keeps failing we surface the failure.
+  const stuckSent = await env.DB.prepare(
+    "SELECT id FROM airtime_orders WHERE status = 'sent' AND sent_at < datetime('now', '-30 minutes') AND attempts < 2"
+  ).all<{ id: number }>();
+  for (const row of stuckSent.results) {
+    await env.DB.prepare("UPDATE airtime_orders SET status = 'paid' WHERE id = ?").bind(row.id).run();
+    await fulfillAirtimeOrder(env, row.id);
+  }
+  const failed = await env.DB.prepare(
+    "SELECT id FROM airtime_orders WHERE status = 'failed' AND attempts < 3 AND created_at >= datetime('now', '-3 days')"
+  ).all<{ id: number }>();
+  for (const row of failed.results) {
+    await env.DB.prepare("UPDATE airtime_orders SET status = 'paid' WHERE id = ?").bind(row.id).run();
+    await fulfillAirtimeOrder(env, row.id);
+  }
+}
 
 // Admin: update airtime config
 app.put("/api/admin/airtime/config", async (c) => {
@@ -4718,7 +6463,41 @@ app.put("/api/admin/airtime/config", async (c) => {
   if (body.markupPct) await setSetting(c.env, "airtime_markup_pct", String(body.markupPct));
   if (body.minAmountCents) await setSetting(c.env, "airtime_min_amount_cents", String(body.minAmountCents));
   if (body.maxAmountCents) await setSetting(c.env, "airtime_max_amount_cents", String(body.maxAmountCents));
+  if (body.bonusPct !== undefined) await setSetting(c.env, "airtime_bonus_pct", String(Math.max(0, Math.min(50, Math.round(Number(body.bonusPct))))));
   return c.json({ ok: true });
+});
+
+// Admin: verify Africa's Talking airtime credentials by sending a real
+// K1 top-up to a provided Zambian number. Also reports AT account status.
+app.post("/api/admin/airtime/test", async (c) => {
+  const admin = await requireAdmin(c);
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const phone = String(body.phone ?? "").trim();
+  const digits = phone.replace(/\D/g, "");
+  const validPhone =
+    (digits.startsWith("260") && digits.length === 12) ||
+    (digits.startsWith("0") && digits.length === 10);
+  if (!validPhone) {
+    return c.json({ error: "Enter a valid Zambian phone number (e.g. +260 977 123 456)." }, 400);
+  }
+  if (!c.env.AT_API_KEY || !c.env.AT_USERNAME) {
+    return c.json({ error: "Africa's Talking credentials not configured on the worker." }, 500);
+  }
+  const e164 = digits.startsWith("260") ? `+${digits}` : `+260${digits.slice(1)}`;
+  try {
+    const res = await sendAirtime(c.env, e164, 1);
+    await logLipilaEvent(c.env.DB, "airtime_test", `TEST-${Date.now()}`, e164, 100, JSON.stringify(res).slice(0, 500));
+    return c.json({
+      ok: true,
+      message: "K1 airtime sent — check the recipient phone for delivery.",
+      response: res,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await logLipilaEvent(c.env.DB, "airtime_test", `TEST-${Date.now()}`, e164, 100, msg);
+    return c.json({ error: `Airtime test failed: ${msg}` }, 502);
+  }
 });
 
 // ===================================================================
@@ -4767,6 +6546,116 @@ app.post("/api/admin/disburse-now", async (c) => {
 
   await runAutoDisburse(c.env);
   return c.json({ ok: true, message: "Auto-disburse triggered for all campaigns" });
+});
+
+// ===================================================================
+// MNO HEALTH STATUS - public endpoint + cron check
+// ===================================================================
+
+const ZM_MNO_IDS = ["airtel", "mtn", "zamtel"] as const;
+
+async function refreshMnoHealth(env: Bindings): Promise<void> {
+  const now = new Date();
+  const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+
+  // Map prefixes to network IDs
+  const PREFIX_MAP: Record<string, string> = {};
+  for (const net of ZM_NETWORKS) {
+    for (const pfx of net.prefixes) PREFIX_MAP[pfx] = net.id;
+  }
+
+  function detectNetwork(phone: string): string | null {
+    const digits = phone.replace(/\D/g, "").replace(/^260/, "");
+    const local = digits.startsWith("0") ? digits : `0${digits}`;
+    return PREFIX_MAP[local.slice(0, 3)] ?? null;
+  }
+
+  for (const network of ZM_MNO_IDS) {
+    // Count successes where phone matches this network
+    const successRow = await env.DB.prepare(
+      `SELECT COUNT(*) as cnt FROM lipila_logs
+       WHERE kind = 'disbursement' AND status = 'success' AND created_at > ?`
+    ).bind(oneHourAgo).first<{ cnt: number }>();
+
+    const failRow = await env.DB.prepare(
+      `SELECT COUNT(*) as cnt FROM lipila_logs
+       WHERE kind = 'disbursement' AND status = 'failed' AND created_at > ?`
+    ).bind(oneHourAgo).first<{ cnt: number }>();
+
+    // Get all recent logs and filter by network in JS
+    const allRecent = await env.DB.prepare(
+      `SELECT phone, status FROM lipila_logs
+       WHERE kind = 'disbursement' AND created_at > ?`
+    ).bind(oneHourAgo).all<{ phone: string; status: string }>();
+
+    let networkSuccess = 0;
+    let networkFail = 0;
+    let lastSuccessTime: string | null = null;
+    let lastFailTime: string | null = null;
+
+    for (const row of allRecent.results) {
+      const net = detectNetwork(row.phone ?? "");
+      if (net !== network) continue;
+      if (row.status === "success") networkSuccess++;
+      else if (row.status === "failed") networkFail++;
+    }
+
+    const total = networkSuccess + networkFail;
+    const successRate = total > 0 ? networkSuccess / total : 1;
+
+    let status = "operational";
+    if (total === 0) status = "unknown";
+    else if (successRate < 0.3) status = "down";
+    else if (successRate < 0.7) status = "degraded";
+
+    const lastSuccess = await env.DB.prepare(
+      `SELECT created_at FROM lipila_logs
+       WHERE kind = 'disbursement' AND status = 'success'
+       ORDER BY created_at DESC LIMIT 1`
+    ).first<{ created_at: string }>();
+
+    const lastFail = await env.DB.prepare(
+      `SELECT created_at FROM lipila_logs
+       WHERE kind = 'disbursement' AND status = 'failed'
+       ORDER BY created_at DESC LIMIT 1`
+    ).first<{ created_at: string }>();
+
+    await env.DB.prepare(
+      `INSERT INTO mno_health (network, status, success_count, fail_count, success_rate, last_checked_at, last_success_at, last_failure_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(network) DO UPDATE SET
+         status = excluded.status,
+         success_count = excluded.success_count,
+         fail_count = excluded.fail_count,
+         success_rate = excluded.success_rate,
+         last_checked_at = excluded.last_checked_at,
+         last_success_at = excluded.last_success_at,
+         last_failure_at = excluded.last_failure_at,
+         updated_at = excluded.updated_at`
+    ).bind(
+      network, status, networkSuccess, networkFail, successRate,
+      now.toISOString(), lastSuccess?.created_at ?? null, lastFail?.created_at ?? null
+    ).run();
+  }
+}
+
+app.get("/api/mno-status", async (c) => {
+  let rows = await c.env.DB.prepare(
+    "SELECT network, status, success_count, fail_count, success_rate, last_checked_at, last_success_at, last_failure_at FROM mno_health"
+  ).all<Record<string, any>>();
+
+  // If no data yet, run the health check now
+  if (rows.results.length === 0) {
+    await refreshMnoHealth(c.env);
+    rows = await c.env.DB.prepare(
+      "SELECT network, status, success_count, fail_count, success_rate, last_checked_at, last_success_at, last_failure_at FROM mno_health"
+    ).all<Record<string, any>>();
+  }
+
+  return c.json({
+    networks: rows.results,
+    checkedAt: new Date().toISOString(),
+  });
 });
 
 export default appObject;

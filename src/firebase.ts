@@ -24,6 +24,13 @@ export function getMessagingClient(env: { FIREBASE_CLIENT_EMAIL: string; FIREBAS
   return _messaging;
 }
 
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 1000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function sendPushNotification(
   env: { FIREBASE_CLIENT_EMAIL: string; FIREBASE_PRIVATE_KEY: string },
   fcmToken: string,
@@ -31,20 +38,32 @@ export async function sendPushNotification(
   body: string,
   data?: Record<string, string>
 ): Promise<boolean> {
-  try {
-    const msg = getMessagingClient(env);
-    await msg.send({
-      token: fcmToken,
-      notification: { title, body },
-      data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
-      android: { priority: "high" },
-      apns: { payload: { aps: { contentAvailable: true } } },
-    });
-    return true;
-  } catch (e) {
-    console.error("FCM send failed:", e);
-    return false;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const msg = getMessagingClient(env);
+      await msg.send({
+        token: fcmToken,
+        notification: { title, body },
+        data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
+        android: { priority: "high" as const, ttl: 3600000 },
+        apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
+      });
+      return true;
+    } catch (e: any) {
+      const code = e?.code ?? "";
+      // Don't retry on invalid tokens or permission issues — they won't resolve
+      if (code.includes("invalid-registration-token") || code.includes("registration-token-not-registered") || code.includes("invalid-argument")) {
+        console.error("FCM non-retryable error:", code);
+        return false;
+      }
+      if (attempt < MAX_RETRIES) {
+        await delay(RETRY_DELAY_MS * (attempt + 1));
+      } else {
+        console.error("FCM send failed after retries:", e);
+      }
+    }
   }
+  return false;
 }
 
 export async function sendMulticastPush(
@@ -53,19 +72,45 @@ export async function sendMulticastPush(
   title: string,
   body: string,
   data?: Record<string, string>
-): Promise<{ success: number; failure: number }> {
-  if (!tokens.length) return { success: 0, failure: 0 };
-  try {
-    const msg = getMessagingClient(env);
-    const res = await msg.sendEachForMulticast({
-      tokens,
-      notification: { title, body },
-      data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
-      android: { priority: "high" },
-    });
-    return { success: res.successCount, failure: res.failureCount };
-  } catch (e) {
-    console.error("FCM multicast failed:", e);
-    return { success: 0, failure: tokens.length };
+): Promise<{ success: number; failure: number; failedTokens: string[] }> {
+  if (!tokens.length) return { success: 0, failure: 0, failedTokens: [] };
+
+  const payload = {
+    tokens,
+    notification: { title, body },
+    data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
+    android: { priority: "high" as const, ttl: 3600000 },
+    apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
+  };
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const msg = getMessagingClient(env);
+      const res = await msg.sendEachForMulticast(payload);
+      const failedTokens: string[] = [];
+      const nonRetryableErrors = ["invalid-registration-token", "registration-token-not-registered", "invalid-argument"];
+      res.responses.forEach((r, i) => {
+        if (!r.success && r.error) {
+          const code = r.error.code ?? "";
+          if (nonRetryableErrors.some((e) => code.includes(e))) {
+            failedTokens.push(tokens[i]);
+          } else if (attempt < MAX_RETRIES) {
+            // Will retry on next attempt
+          } else {
+            failedTokens.push(tokens[i]);
+          }
+          if (i < 3) console.error("FCM token error:", code || r.error.message);
+        }
+      });
+      return { success: res.successCount, failure: res.failureCount, failedTokens };
+    } catch (e) {
+      if (attempt < MAX_RETRIES) {
+        await delay(RETRY_DELAY_MS * (attempt + 1));
+      } else {
+        console.error("FCM multicast failed after retries:", e);
+        return { success: 0, failure: tokens.length, failedTokens: tokens };
+      }
+    }
   }
+  return { success: 0, failure: tokens.length, failedTokens: tokens };
 }
