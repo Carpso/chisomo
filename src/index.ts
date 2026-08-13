@@ -261,27 +261,49 @@ async function pushOnly(env: Bindings, userId: number | null, pushTitle: string,
   }
 }
 
-/** Push-only alert to admins with the app installed (in-app notifications,
- *  never SMS). Used for support tickets and similar non-urgent admin alerts. */
+/**
+ * Push-only alert to the admin team (superadmins + assistants with the app
+ * installed; in-app notifications, never SMS). Used for support tickets and
+ * other admin alerts. Superadmins come from SUPERADMIN_PHONES; assistants are
+ * every user in admin_assistants, so a team member always sees what hosts and
+ * donors do.
+ */
 async function pushAdmins(env: Bindings, title: string, body: string, data?: Record<string, string>): Promise<void> {
   if (!envPushConfigured(env)) return;
   const phones = (env.SUPERADMIN_PHONES ?? "").split(",").map((p) => p.trim()).filter(Boolean);
-  if (!phones.length) return;
-  const placeholders = phones.map(() => "?").join(",");
-  const rows = await env.DB.prepare(
+  const userIds = new Set<number>();
+  const tokens = new Set<string>();
+
+  if (phones.length) {
+    const placeholders = phones.map(() => "?").join(",");
+    const rows = await env.DB.prepare(
+      `SELECT DISTINCT dt.token, dt.user_id FROM device_tokens dt
+       JOIN users u ON u.id = dt.user_id
+       WHERE u.phone IN (${placeholders})`
+    ).bind(...phones).all<{ token: string; user_id: number }>();
+    for (const r of rows.results) {
+      tokens.add(r.token);
+      userIds.add(r.user_id);
+    }
+  }
+
+  // Assistants: every user who has been granted admin-assistant access.
+  const assistantRows = await env.DB.prepare(
     `SELECT DISTINCT dt.token, dt.user_id FROM device_tokens dt
-     JOIN users u ON u.id = dt.user_id
-     WHERE u.phone IN (${placeholders})`
-  ).bind(...phones).all<{ token: string; user_id: number }>();
-  const tokens = rows.results.map((r) => r.token);
-  if (!tokens.length) return;
-  // Record an in-app notification for each admin too.
-  const adminUserIds = [...new Set(rows.results.map((r) => r.user_id))];
-  for (const uid of adminUserIds) {
+     JOIN admin_assistants a ON a.user_id = dt.user_id`
+  ).all<{ token: string; user_id: number }>();
+  for (const r of assistantRows.results) {
+    tokens.add(r.token);
+    userIds.add(r.user_id);
+  }
+
+  if (!tokens.size) return;
+  // Record an in-app notification for each admin/assistant too.
+  for (const uid of userIds) {
     await recordNotification(env, uid, data?.type ?? "admin_alert", title, body, data);
   }
-  const result = await sendMulticastPush(fbEnv(env), tokens, title, body, data)
-    .catch((e) => { console.error("admin push failed:", e); return { success: 0, failure: tokens.length, failedTokens: tokens as string[] }; });
+  const result = await sendMulticastPush(fbEnv(env), [...tokens], title, body, data)
+    .catch((e) => { console.error("admin push failed:", e); return { success: 0, failure: tokens.size, failedTokens: [...tokens] }; });
   if (result.failedTokens.length) {
     await pruneInvalidTokens(env, result.failedTokens);
   }
@@ -835,6 +857,10 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
     await env.DB.prepare(
       "UPDATE withdrawals SET lipila_identifier = ? WHERE lipila_reference = ?"
     ).bind(result.identifier, referenceId).run();
+    // Alert the admin team that money is moving out (payout initiated).
+    await pushAdmins(env, "Payout started",
+      `${(payoutCents / 100).toLocaleString()} ZMW being sent to the host of "${campaign.title}".`,
+      { type: "payout_started", campaignId: String(campaign.id) }).catch(() => {});
     return payoutCents;
   } catch (e) {
     const reason = (e instanceof Error ? e.message : String(e)).slice(0, 500);
@@ -1232,6 +1258,9 @@ async function confirmWithdrawal(env: Bindings, referenceId: string): Promise<vo
       "Payout sent",
       `Your payout of ${(row.amount_cents / 100).toLocaleString()} ZMW for "${campaign.title}" is on its way to your mobile money.`,
       { type: "payout_sent", campaignId: String(campaign.id) });
+    await pushAdmins(env, "Payout sent",
+      `${(row.amount_cents / 100).toLocaleString()} ZMW delivered to the host of "${campaign.title}".`,
+      { type: "payout_sent", campaignId: String(campaign.id) }).catch(() => {});
   }
 }
 
@@ -2742,8 +2771,16 @@ app.get("/api/contributions/status/:referenceId", async (c) => {
         await confirmContribution(c.env, effectiveRef);
         row.status = "confirmed";
       } else if (s.includes("fail") || s.includes("cancelled") || s.includes("canceled")) {
-        await failContribution(c.env, effectiveRef);
-        row.status = "failed";
+        // Grace period: Lipila can briefly report a failure right after the
+        // USSD prompt is dispatched, before the donor has entered their PIN.
+        // Only treat it as failed once the prompt has had time to settle
+        // (webhooks are authoritative; a status-check alone shouldn't fail a
+        // payment the user may still be completing).
+        const createdAgoSec = (Date.now() - new Date(row.created_at.replace(" ", "T") + "Z").getTime()) / 1000;
+        if (createdAgoSec >= 90) {
+          await failContribution(c.env, effectiveRef);
+          row.status = "failed";
+        }
       }
     } catch (e) {
       console.error("status check failed:", e);
@@ -7096,6 +7133,8 @@ function sharePageHtml(opts: {
     <label>Your name (optional)</label>
     <input id="name" placeholder="e.g. Pastor John">
     ${isEvent ? "" : `<label>How much? (K)</label><input id="custom" inputmode="numeric" placeholder="e.g. 100" style="display:none">`}
+    <label>Email for card (required for card)</label>
+    <input id="email" inputmode="email" placeholder="you@example.com">
     ${isEvent ? `<div class="note">iPhone? Pay right here with mobile money or card — no app needed.</div>` : `<div class="note">iPhone? You can give right here — no app needed. You'll get a payment prompt on your phone.</div>`}
     <button class="pay" id="btnMomo" onclick="start('momo')">${isEvent ? "Buy ticket with Mobile Money" : "Give with Mobile Money"}</button>
     <button class="pay card" id="btnCard" onclick="start('card')">${isEvent ? "Buy ticket by Card" : "Give by Card"}</button>
@@ -7132,16 +7171,19 @@ function esc(s){var d=document.createElement("div");d.textContent=s||"";return d
 function start(method){
   var phone=byId("phone").value.trim();
   var name=byId("name").value.trim();
+  var email=byId("email")?byId("email").value.trim():"";
   var cust=byId("custom")?parseFloat(byId("custom").value.replace(/,/g,"")):NaN;
   var amountCents;
   if(IS_EVENT){amountCents=TIERS[CUR.tier].amountCents*CUR.qty;}
   else if(CUR.amount===0){if(!(cust>0)){alert("Enter an amount");return;}amountCents=Math.round(cust*100);}
   else{amountCents=CUR.amount;}
-  if(amountCents<100){alert("Minimum is K1.00");return;}
+  if(amountCents<500){alert("Minimum is K5.00");return;}
+  if(method==="card" && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)){alert("Enter your email address for the card receipt.");return;}
   if(!/^\\+?260[0-9]{9}$/.test(phone.replace(/[\\s-]/g,""))){alert("Enter a valid Zambian number, e.g. +260 97 000 0000");return;}
   localStorage.setItem("ksPhone",phone);
   var body={amountCents:amountCents,phone:phone,donorName:name};
   if(IS_EVENT){body.tierName=TIERS[CUR.tier].name;body.ticketQty=CUR.qty;}
+  if(method==="card"){body.email=email;}
   var path="/api/campaigns/"+CAMPAIGN.id+"/"+(method==="card"?"contribute-card":"contribute");
   byId("btnMomo").disabled=true;byId("btnCard").disabled=true;
   fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})

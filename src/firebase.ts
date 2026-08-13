@@ -45,7 +45,17 @@ export async function sendPushNotification(
         token: fcmToken,
         notification: { title, body },
         data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
-        android: { priority: "high" as const, ttl: 3600000 },
+        android: {
+          priority: "high" as const,
+          ttl: 3600000,
+          notification: {
+            channelId: "giving_updates",
+            sound: "default",
+            priority: "high" as const,
+            visibility: "public" as const,
+            color: "#E65100",
+          },
+        },
         apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
       });
       return true;
@@ -79,7 +89,17 @@ export async function sendMulticastPush(
     tokens,
     notification: { title, body },
     data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
-    android: { priority: "high" as const, ttl: 3600000 },
+    android: {
+      priority: "high" as const,
+      ttl: 3600000,
+      notification: {
+        channelId: "giving_updates",
+        sound: "default",
+        priority: "high" as const,
+        visibility: "public" as const,
+        color: "#E65100",
+      },
+    },
     apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
   };
 
