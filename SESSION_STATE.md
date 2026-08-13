@@ -2,9 +2,9 @@
 
 **Last Updated**: 2026-08-13
 **Version**: 0.7.0 (versionCode 75)
-**Flutter Commit**: `e191e0d`
-**Backend Commit**: `fd3149a`
-**Backend Deployed Version ID**: `3c9b45d2-2c7d-49b1-981a-4c2a77b2d284`
+**Flutter Commit**: `3586782` (+ latest unpushed)
+**Backend Commit**: `dbfc5c4` (+ latest unpushed)
+**Backend Deployed Version ID**: `1c7e0913-fb8e-48b1-9de5-5a5416763b44`
 
 ---
 
@@ -264,9 +264,23 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
 
 ## Next Session Checklist
 
-1. Verify push notifications arrive on a real device (test via Settings → Test notification)
+1. Verify push notifications arrive on a real device (test via Settings → Test notification — it now force-refreshes stale FCM tokens and retries; if it still shows "0 of 1 device", the phone's POST_NOTIFICATIONS permission is off)
 2. Confirm announcements moderation works end-to-end (host posts → admin approves → donors pushed)
 3. Confirm assistant account can log in and sees only its scoped tiles
 4. Upload `app-release.aab` (0.7.0/75) to the Play Console
 5. Real-device QA on give-money + buy-ticket for MTN and Airtel
 6. Consider funding airtime + enabling it, and starting the Apple developer account for iOS
+7. Re-run migration_v44's app_settings inserts on any fresh DB (already applied to production; the ALTER TABLE part fails on re-run so apply the settings separately)
+
+## Recent session highlights (0.7.0 hardening pass)
+- **Push banners fixed**: Settings → Test notification force-refreshes the FCM token when FCM reports 0 deliveries; backend test-push reports honest sentCount; `giving_updates` channel self-heals; FCM payload pins channelId + high priority + public visibility + sound.
+- **Event finder's commission**: admin-set K10 (MoMo + card) deducted from event ticket host payouts on top of the normal cut + Lipila 1.5%; per-event waive (`waive_event_fees`); all editable from Admin → Fees & commissions. Migration v44.
+- **Remote config**: fees (platform %/min/fixed, MoMo + card), airtime, badge, promotions, referral threshold, sample images — all changeable from the dashboard without redeploying (app_settings).
+- **Dashboard speed**: admin calls parallelized; campaignPublic loops use Promise.all (admin campaigns 23s → ~3s).
+- **Events first-class**: event-worded notifications ("Ticket confirmed", "New event posted"), live feed respects hide_amount/anonymous, admin/team event delete, event detail keeps one Share button.
+- **Sample images**: admins upload posters (`/api/admin/sample-images`) that appear in the event create screen's sample picker.
+- **Create templates**: campaign + event starter templates prefill title/description/category/goal/photo.
+- **Personal backup**: `GET /api/me/backup` + Settings → Backup my data (JSON share).
+- **Outreach copy**: `docs/OUTREACH_TEMPLATES.md` (hosts/donors/promoters) + 30-day Facebook calendar in the Flutter repo.
+- **Share card is orange**, duplicate share buttons removed, "Go Live" casing.
+- Tests: 51 backend (fees, webhook idempotency + handler, parse-tiers, moneyRef) + 29 Flutter (money, fx, payment screens, deep links, promote).

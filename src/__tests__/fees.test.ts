@@ -71,12 +71,44 @@ describe("donationFees (cards)", () => {
   });
 });
 
+describe("donationFees (event commission overrides)", () => {
+  it("waives the platform fee but keeps Lipila's fee", () => {
+    const f = donationFees(50000, DEFAULT, "momo", { waivePlatform: true });
+    expect(f.platformFeeCents).toBe(0);
+    expect(f.lipilaFeeCents).toBe(1250); // 2.5% of K500
+  });
+
+  it("collection stays the default 1% + K0.48 (K10 finder's fee is on payout)", () => {
+    const f = donationFees(50000, DEFAULT, "momo");
+    expect(f.platformFeeCents).toBe(548); // 1% = K5 + K0.48
+    expect(f.lipilaFeeCents).toBe(1250);
+  });
+
+  it("waives the platform fee for cards too", () => {
+    const f = donationFees(50000, DEFAULT, "card", { waivePlatform: true });
+    expect(f.platformFeeCents).toBe(0);
+    expect(f.lipilaFeeCents).toBe(1250); // 2.5% Lipila card fee
+  });
+});
+
 describe("payoutAmountCents", () => {
   it("deducts both disbursement fees including the ZMW 0.48 fixed fee", () => {
     const available = 10000; // K100
     const payout = payoutAmountCents(available, DEFAULT);
     expect(payout).toBe(available - disbursementFeeCents(available, DEFAULT) - platformDisbursementFeeCents(available, DEFAULT));
     expect(payout).toBe(10000 - 150 - 348); // 1.5% + K3 min + ZMW 0.4800
+  });
+
+  it("events use a flat K10 finder's commission on top of the normal cut", () => {
+    // K500 event payout: Lipila 1.5% = K7.50; platform = normal cut (K5+0.48)
+    // PLUS K10 finder's fee = K15.48. Host receives K500 - 7.50 - 15.48.
+    const available = 50000;
+    const lipila = disbursementFeeCents(available, DEFAULT);
+    expect(lipila).toBe(750);
+    const normal = platformDisbursementFeeCents(available, DEFAULT);
+    expect(normal).toBe(548); // 1% = K5 + K0.48
+    const finderFee = 1000; // K10
+    expect(available - lipila - normal - finderFee).toBe(50000 - 750 - 548 - 1000); // K477.02
   });
 
   it("applies the ZMW 0.48 fixed fee when the percentage exceeds the K3 minimum", () => {

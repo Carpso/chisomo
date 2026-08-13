@@ -71,25 +71,55 @@ export function pctOf(cents: number, pct: number): number {
   return Math.round((cents * pct) / 100);
 }
 
-/** Donation -> fees taken from that donation. Platform fee is K3 min + ZMW 0.48 per tx, else pct. Always the real K3/1% + ZMW 0.48. Cards: K5 min / 2% + ZMW 0.48 + Lipila's card collection fee. */
-export function donationFees(amountCents: number, cfg: FeeConfig, method: "momo" | "card" = "momo") {
+/** Optional fee overrides for a specific transaction (event commission). */
+export interface FeeOverrides {
+  /** Flat % charged by Kingdom Sponsor (replaces platformPct). */
+  platformPct?: number;
+  /** Minimum platform fee in cents (replaces platformMinFeeCents). */
+  platformMinFeeCents?: number;
+  /** Fixed fee in cents (defaults to PLATFORM_FIXED_FEE_CENTS). */
+  fixedFeeCents?: number;
+  /** When true, Kingdom Sponsor takes NO platform fee (only Lipila's fee). */
+  waivePlatform?: boolean;
+}
+
+/**
+ * Donation / event-ticket fees. Platform fee is K3 min + ZMW 0.48 per tx,
+ * else pct; cards K5 min / 2% + ZMW 0.48 + Lipila's card fee. Pass [overrides]
+ * to waive the platform cut (admin "waive event fees").
+ */
+export function donationFees(
+  amountCents: number,
+  cfg: FeeConfig,
+  method: "momo" | "card" = "momo",
+  overrides?: FeeOverrides
+) {
+  const fixed = overrides?.fixedFeeCents ?? PLATFORM_FIXED_FEE_CENTS;
+  const lipilaPct = method === "card" ? cfg.cardLipilaCollectionPct : cfg.lipilaCollectionPct;
+  const lipilaFeeCents = pctOf(amountCents, lipilaPct);
+
+  if (overrides?.waivePlatform) {
+    // Admin waived the platform commission: the donor only pays Lipila's fee.
+    return { platformFeeCents: 0, lipilaFeeCents };
+  }
+
   if (method === "card") {
-    const lipilaFeeCents = pctOf(amountCents, cfg.cardLipilaCollectionPct);
+    const platformPct = overrides?.platformPct ?? cfg.cardPlatformPct;
+    const platformMin = overrides?.platformMinFeeCents ?? cfg.cardPlatformMinFeeCents;
     const platformFeeCents = Math.max(
-      cfg.cardPlatformMinFeeCents + PLATFORM_FIXED_FEE_CENTS,
-      pctOf(amountCents, cfg.cardPlatformPct) + PLATFORM_FIXED_FEE_CENTS
+      platformMin + fixed,
+      pctOf(amountCents, platformPct) + fixed
     );
     return { platformFeeCents, lipilaFeeCents };
   }
-  const lipilaFeeCents = pctOf(amountCents, cfg.lipilaCollectionPct);
+
+  const platformPct = overrides?.platformPct ?? cfg.platformPct;
+  const platformMin = overrides?.platformMinFeeCents ?? cfg.platformMinFeeCents;
   const platformFeeCents = Math.max(
-    cfg.platformMinFeeCents + PLATFORM_FIXED_FEE_CENTS,
-    pctOf(amountCents, cfg.platformPct) + PLATFORM_FIXED_FEE_CENTS
+    platformMin + fixed,
+    pctOf(amountCents, platformPct) + fixed
   );
-  return {
-    platformFeeCents,
-    lipilaFeeCents,
-  };
+  return { platformFeeCents, lipilaFeeCents };
 }
 
 /**

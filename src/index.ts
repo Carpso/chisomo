@@ -807,6 +807,53 @@ const [raised, withdrawn, disbursementFees, payoutPlatformFees] = await env.DB.b
   return Math.max(0, balance); // never show a negative withdrawable balance
 }
 
+/**
+ * Collection-side overrides for an event ticket sale. Collection stays the
+ * default platform fee (1% / K3 min + K0.48); the K10 finder's commission is
+ * deducted on DISBURSEMENT (payout). `waivePlatform` zeroes the collection cut
+ * when the admin enabled "waive event fees" on the event.
+ */
+async function eventFeeOverrides(env: Bindings, campaign: Record<string, any>) {
+  return { waivePlatform: !!campaign.waive_event_fees };
+}
+
+/**
+ * Fee config with admin-dashboard overrides merged in (falls back to the
+ * wrangler-var defaults when an admin setting hasn't been written). Lets admins
+ * adjust platform %, minimums and fixed fees without redeploying.
+ */
+async function adminFeeConfig(env: Bindings) {
+  const base = loadFeeConfig(env);
+  const num = (v: string | null, fallback: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  return {
+    ...base,
+    platformPct: num(await getSetting(env, "platform_fee_pct"), base.platformPct),
+    platformMinFeeCents: Math.round(num(await getSetting(env, "platform_min_fee_cents"), base.platformMinFeeCents)),
+    platformFixedFeeCents: Math.round(num(await getSetting(env, "platform_fixed_fee_cents"), 48)),
+    cardPlatformPct: num(await getSetting(env, "card_platform_fee_pct"), base.cardPlatformPct),
+    cardPlatformMinFeeCents: Math.round(num(await getSetting(env, "card_platform_min_fee_cents"), base.cardPlatformMinFeeCents)),
+    cardLipilaCollectionPct: num(await getSetting(env, "card_lipila_collection_fee_pct"), base.cardLipilaCollectionPct),
+  };
+}
+
+/**
+ * Disbursement fees for an event payout: the NORMAL platform cut
+ * (max(K3, 1%) + K0.48) PLUS the admin-configured K10 finder's commission,
+ * all on top of Lipila's 1.5%. Non-events pay only the normal cut.
+ * Returns 0 when the event's payout fees are waived (waive_payout_fees).
+ */
+async function eventDisbursementFeeCents(env: Bindings, campaign: Record<string, any>, availableCents: number): Promise<number> {
+  if (campaign.waive_payout_fees) return 0;
+  const normal = platformDisbursementFeeCents(availableCents, await adminFeeConfig(env));
+  const isEvent = !!campaign.event_tiers && String(campaign.event_tiers).length > 2;
+  if (!isEvent) return normal;
+  const finderFee = Number(await getSetting(env, "event_commission_finder_fee_cents")) || 1000; // K10
+  return Math.min(normal + finderFee, availableCents);
+}
+
 /** Create a payout of the campaign's available balance, deducting Lipila's disbursement fee and Kingdom Sponsor's payout cut. Returns the host payout cents sent (0 if none). */
 async function createWithdrawal(env: Bindings, campaignId: number): Promise<number> {
   const cfg = loadFeeConfig(env);
@@ -840,8 +887,11 @@ async function createWithdrawal(env: Bindings, campaignId: number): Promise<numb
   // payout — the full available balance is sent.
   const waiveFees = !!campaign.waive_payout_fees;
   const lipilaFee = waiveFees ? 0 : disbursementFeeCents(available, cfg);
-  const platformFee = waiveFees ? 0 : platformDisbursementFeeCents(available, cfg);
-  const payoutCents = waiveFees ? available : payoutAmountCents(available, cfg);
+  // Event ticket campaigns carry a flat K10 finder's commission deducted from
+  // the host's payout, ON TOP of Lipila's 1.5%. Non-events use the default
+  // max(K3, 1%) + K0.48 payout cut.
+  const platformFee = waiveFees ? 0 : (await eventDisbursementFeeCents(env, campaign, available));
+  const payoutCents = waiveFees ? available : available - lipilaFee - platformFee;
   if (payoutCents <= 0) return 0;
 
   const referenceId = moneyRef("PAY", campaignId);
@@ -1975,6 +2025,7 @@ async function campaignPublic(env: Bindings, row: Record<string, any>, authUserI
     category: row.category ?? "Other",
     visibility: row.visibility ?? "public",
     waivePayoutFees: !!row.waive_payout_fees,
+    waiveEventFees: !!row.waive_event_fees,
     eventTiers: parseEventTiers(row.event_tiers),
     eventCapacity: Math.max(0, Number(row.event_capacity) || 0),
     eventDate: row.event_date ?? null,
@@ -2615,8 +2666,9 @@ app.post("/api/campaigns/:id/contribute", async (c) => {
   ).bind(phone).first<{ n: number }>())?.n ?? 0;
   if (recent >= 3) return c.json({ error: "Too many attempts. Wait a moment and try again." }, 429);
 
-  const cfg = loadFeeConfig(c.env);
-  const fees = donationFees(amountCents, cfg);
+  const cfg = await adminFeeConfig(c.env);
+  const overrides = tiers.length > 0 ? await eventFeeOverrides(c.env, campaign) : undefined;
+  const fees = donationFees(amountCents, cfg, "momo", overrides);
   const totalCents = amountCents + fees.platformFeeCents + fees.lipilaFeeCents;
   const referenceId = moneyRef("CON", Number(campaign.id));
 
@@ -2718,8 +2770,9 @@ app.post("/api/campaigns/:id/contribute-card", async (c) => {
   ).bind(phone).first<{ n: number }>())?.n ?? 0;
   if (recent >= 3) return c.json({ error: "Too many attempts. Wait a moment and try again." }, 429);
 
-  const cfg = loadFeeConfig(c.env);
-  const fees = donationFees(amountCents, cfg, "card");
+  const cfg = await adminFeeConfig(c.env);
+  const overrides = tiers.length > 0 ? await eventFeeOverrides(c.env, campaign) : undefined;
+  const fees = donationFees(amountCents, cfg, "card", overrides);
   const totalCents = amountCents + fees.platformFeeCents + fees.lipilaFeeCents;
   const referenceId = moneyRef("CON", Number(campaign.id));
 
@@ -3725,6 +3778,56 @@ app.post("/api/me/notifications/read-all", async (c) => {
   await c.env.DB.prepare("UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0")
     .bind(user.sub).run();
   return c.json({ ok: true });
+});
+
+/** User/host: export a personal backup of everything tied to this account
+ *  (profile, giving history, hosted campaigns/events, pledges, links, badges).
+ *  Downloadable as JSON from Settings → Backup my data. */
+app.get("/api/me/backup", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const profile = await c.env.DB.prepare(
+    "SELECT id, phone, username, name, is_host, host_status, host_org, host_role, host_verified, created_at FROM users WHERE id = ?"
+  ).bind(user.sub).first<Record<string, any>>();
+
+  const contributions = (await c.env.DB.prepare(
+    `SELECT co.id, co.campaign_id, cam.title AS campaign_title, co.donor_name, co.is_anonymous,
+            co.hide_amount, co.amount_cents, co.platform_fee_cents, co.lipila_fee_cents,
+            co.status, co.tier_name, co.ticket_qty, co.created_at
+     FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
+     WHERE co.donor_user_id = ? OR co.phone = ?
+     ORDER BY co.created_at DESC LIMIT 500`
+  ).bind(user.sub, user.phone).all<Record<string, any>>()).results;
+
+  const hosted = (await c.env.DB.prepare(
+    `SELECT c.id, c.title, c.campaign_type, c.status, c.category, c.visibility, c.goal_cents,
+            c.event_capacity, c.event_tiers, c.event_date, c.event_venue, c.created_at
+     FROM campaigns c WHERE c.host_user_id = ? ORDER BY c.created_at DESC LIMIT 200`
+  ).bind(user.sub).all<Record<string, any>>()).results;
+
+  const pledges = (await c.env.DB.prepare(
+    "SELECT id, campaign_id, amount_cents, day_of_month, active, created_at FROM recurring_pledges WHERE user_id = ?"
+  ).bind(user.sub).all<Record<string, any>>()).results;
+
+  const links = (await c.env.DB.prepare(
+    "SELECT id, link_type, status, created_at FROM user_links WHERE user_id = ? OR linked_user_id = ?"
+  ).bind(user.sub, user.sub).all<Record<string, any>>()).results;
+
+  const badges = (await c.env.DB.prepare(
+    "SELECT id, tier, status, amount_cents, purchased_at, expires_at FROM host_badges WHERE user_id = ?"
+  ).bind(user.sub).all<Record<string, any>>()).results;
+
+  return c.json({
+    exportedAt: new Date().toISOString(),
+    app: "kingdom-sponsor",
+    user: profile,
+    contributions,
+    hosted,
+    pledges,
+    links,
+    badges,
+  });
 });
 
 // ---------- gamification: achievements ----------
@@ -5222,6 +5325,82 @@ app.get("/api/admin/referral-threshold", async (c) => {
   const admin = await requireStaff(c, "users");
   if (!admin) return c.json({ error: "Admin only" }, 403);
   return c.json({ threshold: await referralRewardThreshold(c.env) });
+});
+
+// ---------- event finder's commission + editable platform fees (admin) ----------
+
+/** Admin: get event commission + editable fee config. */
+app.get("/api/admin/event-commission", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const cfg = await adminFeeConfig(c.env);
+  return c.json({
+    enabled: (await getSetting(c.env, "event_commission_enabled")) === "true",
+    finderFeeCents: Number(await getSetting(c.env, "event_commission_finder_fee_cents")) || 1000,
+    cardFinderFeeCents: Number(await getSetting(c.env, "event_commission_card_finder_fee_cents")) || 1000,
+    platformPct: cfg.platformPct,
+    platformMinFeeCents: cfg.platformMinFeeCents,
+    platformFixedFeeCents: cfg.platformFixedFeeCents,
+    cardPlatformPct: cfg.cardPlatformPct,
+    cardPlatformMinFeeCents: cfg.cardPlatformMinFeeCents,
+    cardLipilaCollectionPct: cfg.cardLipilaCollectionPct,
+    momoPct: cfg.lipilaCollectionPct,
+  });
+});
+
+/** Admin: update event commission + fee config (all dashboard-editable). */
+app.put("/api/admin/event-commission", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+
+  if (typeof body.enabled === "boolean") {
+    await setSetting(c.env, "event_commission_enabled", body.enabled ? "true" : "false");
+  }
+  const clamp = (v: unknown, min: number, max: number, dflt: number) => Math.min(max, Math.max(min, Math.round(Number(v) || dflt)));
+  if (body.finderFeeCents !== undefined) {
+    const v = clamp(body.finderFeeCents, 0, 100000, 1000);
+    await setSetting(c.env, "event_commission_finder_fee_cents", String(v));
+  }
+  if (body.cardFinderFeeCents !== undefined) {
+    const v = clamp(body.cardFinderFeeCents, 0, 100000, 1000);
+    await setSetting(c.env, "event_commission_card_finder_fee_cents", String(v));
+  }
+  if (body.platformPct !== undefined) await setSetting(c.env, "platform_fee_pct", String(clamp(body.platformPct, 0, 100, 1)));
+  if (body.platformMinFeeCents !== undefined) await setSetting(c.env, "platform_min_fee_cents", String(clamp(body.platformMinFeeCents, 0, 10000, 300)));
+  if (body.platformFixedFeeCents !== undefined) await setSetting(c.env, "platform_fixed_fee_cents", String(clamp(body.platformFixedFeeCents, 0, 500, 48)));
+  if (body.cardPlatformPct !== undefined) await setSetting(c.env, "card_platform_fee_pct", String(clamp(body.cardPlatformPct, 0, 100, 2)));
+  if (body.cardPlatformMinFeeCents !== undefined) await setSetting(c.env, "card_platform_min_fee_cents", String(clamp(body.cardPlatformMinFeeCents, 0, 10000, 500)));
+  if (body.cardLipilaCollectionPct !== undefined) await setSetting(c.env, "card_lipila_collection_fee_pct", String(Math.max(0, Math.min(50, Number(body.cardLipilaCollectionPct) || 2.5))));
+
+  const cfg = await adminFeeConfig(c.env);
+  return c.json({
+    ok: true,
+    enabled: (await getSetting(c.env, "event_commission_enabled")) === "true",
+    finderFeeCents: Number(await getSetting(c.env, "event_commission_finder_fee_cents")) || 1000,
+    cardFinderFeeCents: Number(await getSetting(c.env, "event_commission_card_finder_fee_cents")) || 1000,
+    platformPct: cfg.platformPct,
+    platformMinFeeCents: cfg.platformMinFeeCents,
+    platformFixedFeeCents: cfg.platformFixedFeeCents,
+    cardPlatformPct: cfg.cardPlatformPct,
+    cardPlatformMinFeeCents: cfg.cardPlatformMinFeeCents,
+    cardLipilaCollectionPct: cfg.cardLipilaCollectionPct,
+    momoPct: cfg.lipilaCollectionPct,
+  });
+});
+
+/** Admin: set or clear the per-event platform-fee waiver. */
+app.put("/api/admin/campaigns/:id/waive-event-fees", async (c) => {
+  const admin = await requireStaff(c, "campaigns");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const waive = body.waive === true;
+  const res = await c.env.DB.prepare(
+    "UPDATE campaigns SET waive_event_fees = ? WHERE id = ? AND (event_tiers IS NOT NULL AND event_tiers != '')"
+  ).bind(waive ? 1 : 0, id).run();
+  if ((res.meta?.changes ?? 0) === 0) return c.json({ error: "Event not found" }, 404);
+  return c.json({ ok: true, waive });
 });
 
 app.put("/api/admin/referral-threshold", async (c) => {
@@ -7129,6 +7308,67 @@ app.post("/api/campaigns/:id/logo", async (c) => {
     .bind(logoUrl, campaign.id).run();
 
   return c.json({ ok: true, logoUrl });
+});
+
+// ---------- admin sample images (uploaded posters hosts/events can reuse) ----------
+
+/** Public: the admin-uploaded sample images shown in the host/event create
+ *  screens alongside the bundled ones. */
+app.get("/api/sample-images", async (c) => {
+  const raw = (await getSetting(c.env, "sample_images")) || "[]";
+  let list: string[] = [];
+  try { list = JSON.parse(raw); } catch { list = []; }
+  return c.json({ images: list.filter((u): u is string => typeof u === "string" && u.startsWith("http")) });
+});
+
+/** Admin: list the uploaded sample images. */
+app.get("/api/admin/sample-images", async (c) => {
+  const staff = await requireAnyStaff(c);
+  if (!staff) return c.json({ error: "Admin only" }, 403);
+  const raw = (await getSetting(c.env, "sample_images")) || "[]";
+  let list: string[] = [];
+  try { list = JSON.parse(raw); } catch { list = []; }
+  return c.json({ images: list });
+});
+
+/** Admin: upload a sample image hosts/events can use as a poster. */
+app.post("/api/admin/sample-images", async (c) => {
+  const staff = await requireStaff(c, "settings");
+  if (!staff) return c.json({ error: "Admin only" }, 403);
+
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "Upload an image" }, 400);
+  const type = file.type.toLowerCase();
+  const ext = LOGO_TYPES[type];
+  if (!ext) return c.json({ error: "Photo must be PNG, JPG or WebP" }, 400);
+  if (file.size > 3_000_000) return c.json({ error: "Photo must be under 3 MB" }, 400);
+
+  const key = `samples/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  await c.env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: type } });
+  const url = `${c.env.APP_URL}/media/${key}`;
+
+  const raw = (await getSetting(c.env, "sample_images")) || "[]";
+  let list: string[] = [];
+  try { list = JSON.parse(raw); } catch { list = []; }
+  if (!list.includes(url)) list.push(url);
+  await setSetting(c.env, "sample_images", JSON.stringify(list.slice(-30)));
+
+  return c.json({ ok: true, url, images: list.slice(-30) });
+});
+
+/** Admin: remove a sample image. */
+app.delete("/api/admin/sample-images", async (c) => {
+  const staff = await requireStaff(c, "settings");
+  if (!staff) return c.json({ error: "Admin only" }, 403);
+  const url = String(c.req.query("url") ?? "").trim();
+  if (!url) return c.json({ error: "url required" }, 400);
+  const raw = (await getSetting(c.env, "sample_images")) || "[]";
+  let list: string[] = [];
+  try { list = JSON.parse(raw); } catch { list = []; }
+  list = list.filter((u) => u !== url);
+  await setSetting(c.env, "sample_images", JSON.stringify(list));
+  return c.json({ ok: true });
 });
 
 // ---------- public share page (WhatsApp links + QR-friendly) ----------
