@@ -23,7 +23,7 @@ export async function sendOtpSms(env: SmsEnv, phone: string, code: string): Prom
   return sendSms(
     env,
     phone,
-    `KSPONSOR: Your Kingdom Sponsor verification code is ${code}. It expires in 5 minutes. Do not share it.`,
+    `KSPONSOR: Your verification code is ${code}. Valid 5 min. Never share it.`,
   );
 }
 
@@ -67,52 +67,45 @@ export async function sendAirtime(
   return parsed;
 }
 
+/** Hard cap so a message can never exceed ONE Africa's Talking SMS unit.
+ *  `max` defaults to 96 — the platform standard (see messages.ts). */
+export function clampSms(message: string, max = 96): string {
+  if (message.length <= max) return message;
+  return `${message.slice(0, max - 3).trimEnd()}...`;
+}
+
 /** Sends a branded SMS via Africa's Talking.
  *  - ENV=production -> real AT API call (requires AT_API_KEY secret).
  *  - other            -> logged only (no network, no billing during dev/sandbox).
+ *
+ *  The approved, MNO-registered sender ID "KSPONSOR" is ALWAYS used — this
+ *  account never sends from Lipila or any other default sender.
  */
 export async function sendSms(env: SmsEnv, phone: string, message: string): Promise<void> {
+  // Keep every SMS inside one unit (never double-billed).
+  const text = clampSms(message);
   if (env.ENV !== "production") {
-    console.log(`[SMS ${phone}] ${message}`);
+    console.log(`[SMS ${phone}] ${text}`);
     return;
   }
 
-  const send = async (from?: string) => {
-    // AT requires lowercase form field names (username/to/message/from).
-    const form = new URLSearchParams({
-      username: env.AT_USERNAME,
-      to: safePhone(phone),
-      message: message,
-      ...(from ? { from } : {}),
-    });
-    const res = await fetch(AT_MESSAGES_URL, {
-      method: "POST",
-      headers: {
-        Apikey: env.AT_API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: form.toString(),
-    });
-    const body = await res.text().catch(() => "");
-    if (res.ok) return;
-    throw new Error(`Africa's Talking SMS failed (${res.status}): ${body || "empty body"}`);
-  };
-
-  try {
-    // Approved sender ID for this account is "KSPONSOR". Use it for ALL SMS
-    // (OTP + notifications) so messages arrive branded and pass MNO filtering.
-    const sender = (env.AT_FROM && env.AT_FROM.trim()) ? env.AT_FROM.trim() : "KSPONSOR";
-    await send(sender);
-  } catch (e) {
-    // AT returns 400 with "Invalid senderId" until a sender ID is approved.
-    // Fall back to the account's default sender so OTPs keep flowing.
-    if (String(e).includes("(400)")) {
-      console.error("[SMS] sender ID rejected, retrying without FROM:", String(e).slice(0, 200));
-      await send(undefined);
-      console.warn("[SMS] delivered with AT default sender (KSPONSOR rejected)");
-      return;
-    }
-    throw e;
-  }
+  // AT requires lowercase form field names (username/to/message/from).
+  const form = new URLSearchParams({
+    username: env.AT_USERNAME,
+    to: safePhone(phone),
+    message: text,
+    from: "KSPONSOR",
+  });
+  const res = await fetch(AT_MESSAGES_URL, {
+    method: "POST",
+    headers: {
+      Apikey: env.AT_API_KEY,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: form.toString(),
+  });
+  const body = await res.text().catch(() => "");
+  if (res.ok) return;
+  throw new Error(`Africa's Talking SMS failed (${res.status}): ${body || "empty body"}`);
 }

@@ -7,6 +7,7 @@ import {
   feeConfigPublic,
   loadFeeConfig,
   formatKwacha,
+  moneyRef,
   type FeeConfig,
 } from "../fees";
 
@@ -34,54 +35,54 @@ describe("loadFeeConfig", () => {
 });
 
 describe("donationFees", () => {
-  it("charges the flat K3 minimum + ZMW 0.24 on small donations", () => {
+  it("charges the flat K3 minimum + ZMW 0.48 on small donations", () => {
     const f = donationFees(1000, DEFAULT); // K10
-    expect(f.platformFeeCents).toBe(324); // 300 (K3 min) + 24 (ZMW 0.24)
+    expect(f.platformFeeCents).toBe(348); // 300 (K3 min) + 48 (ZMW 0.48)
     expect(f.lipilaFeeCents).toBe(25);
   });
 
-  it("charges 1% + ZMW 0.24 when the percentage exceeds the K3 minimum", () => {
+  it("charges 1% + ZMW 0.48 when the percentage exceeds the K3 minimum", () => {
     const f = donationFees(50000, DEFAULT); // K500 -> 1% = K5
-    expect(f.platformFeeCents).toBe(524); // 500 (1%) + 24
+    expect(f.platformFeeCents).toBe(548); // 500 (1%) + 48
   });
 
   it("never lets the platform fee exceed the donation after Lipila's fee", () => {
-    const f = donationFees(350, DEFAULT); // K3.50
-    expect(f.platformFeeCents).toBeLessThan(350);
-    expect(f.platformFeeCents + f.lipilaFeeCents).toBeLessThan(350);
+    const f = donationFees(500, DEFAULT); // K5 (minimum donation)
+    expect(f.platformFeeCents).toBeLessThan(500);
+    expect(f.platformFeeCents + f.lipilaFeeCents).toBeLessThan(500);
   });
 });
 
 describe("donationFees (cards)", () => {
-  it("charges the flat K5 minimum + ZMW 0.24 on small card donations", () => {
+  it("charges the flat K5 minimum + ZMW 0.48 on small card donations", () => {
     const f = donationFees(1000, DEFAULT, "card"); // K10
-    expect(f.platformFeeCents).toBe(524); // 500 (K5 min) + 24 (ZMW 0.24)
+    expect(f.platformFeeCents).toBe(548); // 500 (K5 min) + 48 (ZMW 0.48)
     expect(f.lipilaFeeCents).toBe(25); // 2.5% Lipila card collection fee
   });
 
-  it("charges 2% + ZMW 0.24 when the percentage exceeds the K5 minimum", () => {
+  it("charges 2% + ZMW 0.48 when the percentage exceeds the K5 minimum", () => {
     const f = donationFees(100000, DEFAULT, "card"); // K1000 -> 2% = K20
-    expect(f.platformFeeCents).toBe(2024); // 2000 (2%) + 24
+    expect(f.platformFeeCents).toBe(2048); // 2000 (2%) + 48
   });
 
   it("momo donations still use K3 min / 1%", () => {
     const f = donationFees(1000, DEFAULT, "momo");
-    expect(f.platformFeeCents).toBe(324);
+    expect(f.platformFeeCents).toBe(348);
   });
 });
 
 describe("payoutAmountCents", () => {
-  it("deducts both disbursement fees including the ZMW 0.24 fixed fee", () => {
+  it("deducts both disbursement fees including the ZMW 0.48 fixed fee", () => {
     const available = 10000; // K100
     const payout = payoutAmountCents(available, DEFAULT);
     expect(payout).toBe(available - disbursementFeeCents(available, DEFAULT) - platformDisbursementFeeCents(available, DEFAULT));
-    expect(payout).toBe(10000 - 150 - 324); // 1.5% + K3 min + ZMW 0.2400
+    expect(payout).toBe(10000 - 150 - 348); // 1.5% + K3 min + ZMW 0.4800
   });
 
-  it("applies the ZMW 0.24 fixed fee when the percentage exceeds the K3 minimum", () => {
+  it("applies the ZMW 0.48 fixed fee when the percentage exceeds the K3 minimum", () => {
     const available = 100000; // K1000 -> 1% = K10
     const fee = platformDisbursementFeeCents(available, DEFAULT);
-    expect(fee).toBe(1024); // 1000 (1%) + 24 (ZMW 0.24)
+    expect(fee).toBe(1048); // 1000 (1%) + 48 (ZMW 0.48)
   });
 
   it("never goes negative", () => {
@@ -108,5 +109,29 @@ describe("formatKwacha", () => {
     expect(formatKwacha(100)).toBe("K1.00");
     expect(formatKwacha(123456)).toBe("K1,234.56");
     expect(formatKwacha(0)).toBe("K0.00");
+  });
+});
+
+describe("moneyRef", () => {
+  it("includes the prefix and scope id", () => {
+    const ref = moneyRef("CON", 42, 1700000000000);
+    expect(ref.startsWith("CON-42-1700000000000-")).toBe(true);
+  });
+
+  it("produces unique references even for the same ms + scope", () => {
+    // Two concurrent donations to campaign 7 in the same millisecond MUST NOT
+    // collide: identical lipila_reference values would break webhook
+    // idempotency (the first confirm would match both rows).
+    const seen = new Set<string>();
+    for (let i = 0; i < 5000; i++) {
+      seen.add(moneyRef("CON", 7, 1700000000000));
+    }
+    expect(seen.size).toBe(5000);
+  });
+
+  it("prefixes distinguish transaction types", () => {
+    expect(moneyRef("PAY", 1).startsWith("PAY-1-")).toBe(true);
+    expect(moneyRef("CON-GIFT", 1).startsWith("CON-GIFT-1-")).toBe(true);
+    expect(moneyRef("REF", 1).startsWith("REF-1-")).toBe(true);
   });
 });

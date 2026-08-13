@@ -1,20 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   kwacha,
-  campaignLink,
+  shortTitle,
   donationConfirmedSms,
   donationReceivedSms,
   payoutSentSms,
-  pledgeReminderSms,
-  promotionActiveSms,
-  promotionRejectedSms,
-  promotionRefundedSms,
-  promotionExpiredSms,
-  milestoneSms,
-  campaignEndedSms,
-  supportReplySms,
-  supportReceivedSms,
+  payoutFailedSms,
+  airtimeSentSms,
+  airtimeDeliveredSms,
+  airtimeFailedSms,
+  accountLinkRequestSms,
 } from "../messages";
+
+const MAX_SMS_LEN = 96;
 
 describe("kwacha", () => {
   it("renders whole kwacha without decimals and fractions with two decimals", () => {
@@ -25,9 +23,44 @@ describe("kwacha", () => {
   });
 });
 
-describe("campaignLink", () => {
-  it("points at the public share page", () => {
-    expect(campaignLink(42)).toBe("https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev/share/42");
+describe("shortTitle", () => {
+  it("keeps short titles intact", () => {
+    expect(shortTitle("Back to school")).toBe("Back to school");
+  });
+  it("truncates long titles with an ellipsis", () => {
+    const t = shortTitle("A very long campaign title that keeps going and going and going");
+    expect(t.length).toBeLessThanOrEqual(18);
+    expect(t.endsWith("…")).toBe(true);
+  });
+});
+
+describe("SMS length cap (single unit rule)", () => {
+  const samples = [
+    donationConfirmedSms("Back to school", 5000, "CON-7-1234"),
+    donationConfirmedSms("A very long campaign title that keeps going and going and going", 123456789, "CON-123456789"),
+    donationReceivedSms("Back to school", 5000, 12300),
+    donationReceivedSms("A very long campaign title that keeps going and going and going", 5000, 123000000),
+    payoutSentSms("Back to school", 9500),
+    payoutSentSms("A very long campaign title that keeps going and going and going", 95000000),
+    payoutFailedSms("Back to school", 9500),
+    payoutFailedSms("A very long campaign title that keeps going and going and going", 95000000),
+    airtimeSentSms(5000),
+    airtimeSentSms(10000000),
+    airtimeDeliveredSms(5000),
+    airtimeDeliveredSms(10000000),
+    airtimeFailedSms(5000),
+    airtimeFailedSms(10000000),
+    accountLinkRequestSms("John Doe", "family", 42),
+  ];
+  it("every SMS fits one 96-character unit", () => {
+    for (const msg of samples) {
+      expect(msg.length, msg).toBeLessThanOrEqual(MAX_SMS_LEN);
+    }
+  });
+  it("every SMS is branded with KSPONSOR", () => {
+    for (const msg of samples) {
+      expect(msg.startsWith("KSPONSOR:")).toBe(true);
+    }
   });
 });
 
@@ -39,88 +72,28 @@ describe("transaction messages", () => {
     expect(msg).toContain("CON-7-1234");
   });
 
-  it("donationConfirmedSms embeds the share link when one is given", () => {
-    expect(donationConfirmedSms("Back to school", 5000, "CON-7-1234", "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
-  });
-
   it("donationReceivedSms shows the current available balance", () => {
     expect(donationReceivedSms("Back to school", 5000, 12300)).toContain("K123");
   });
 
-  it("donationReceivedSms embeds the share link when one is given", () => {
-    expect(donationReceivedSms("Back to school", 5000, 12300, "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
+  it("payoutSentSms mentions the amount", () => {
+    expect(payoutSentSms("Back to school", 9500)).toContain("K95");
+    expect(payoutSentSms("Back to school", 9500)).toContain("Back to school");
   });
 
-  it("payoutSentSms mentions mobile money", () => {
-    expect(payoutSentSms("Back to school", 9500)).toContain("mobile money");
+  it("payoutFailedSms explains the retry", () => {
+    expect(payoutFailedSms("Back to school", 9500)).toContain("retry");
   });
 
-  it("payoutSentSms embeds the share link when one is given", () => {
-    expect(payoutSentSms("Back to school", 9500, "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
+  it("airtime messages carry the amount", () => {
+    expect(airtimeSentSms(5000)).toContain("K50");
+    expect(airtimeDeliveredSms(5000)).toContain("K50");
+    expect(airtimeFailedSms(5000)).toContain("K50");
   });
 
-  it("pledgeReminderSms embeds the share link when one is given", () => {
-    const msg = pledgeReminderSms("Back to school", 5000, "https://bit.ly/xyz");
-    expect(msg).toContain("https://bit.ly/xyz");
-    expect(msg).toContain("K50");
-  });
-
-  it("pledgeReminderSms omits the link without one", () => {
-    expect(pledgeReminderSms("Back to school", 5000)).not.toContain("share/");
-  });
-});
-
-describe("promotion messages", () => {
-  it("promotionActiveSms states days and end date", () => {
-    expect(promotionActiveSms("Back to school", 7, "2026-08-12")).toContain("7 days");
-    expect(promotionActiveSms("Back to school", 7, "2026-08-12")).toContain("2026-08-12");
-  });
-
-  it("promotionActiveSms embeds the share link when one is given", () => {
-    expect(promotionActiveSms("Back to school", 7, "2026-08-12", "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
-  });
-
-  it("promotionRejectedSms points to support for a refund", () => {
-    expect(promotionRejectedSms("Back to school")).toContain("support");
-  });
-
-  it("promotionRefundedSms carries the refunded amount", () => {
-    expect(promotionRefundedSms("Back to school", 15000)).toContain("K150");
-  });
-
-  it("promotionExpiredSms hints at renewing", () => {
-    expect(promotionExpiredSms("Back to school")).toContain("again");
-  });
-});
-
-describe("milestone + campaign-end messages", () => {
-  it("milestoneSms reports the percentage", () => {
-    expect(milestoneSms("Back to school", 50)).toContain("50%");
-  });
-
-  it("campaignEndedSms reports raised amount and supporter count", () => {
-    const msg = campaignEndedSms("Back to school", 500000, 12);
-    expect(msg).toContain("K5,000");
-    expect(msg).toContain("12 supporters");
-  });
-
-  it("campaignEndedSms embeds the share link when one is given", () => {
-    expect(campaignEndedSms("Back to school", 500000, 12, "https://bit.ly/xyz")).toContain("https://bit.ly/xyz");
-  });
-
-  it("campaignEndedSms omits the link without one", () => {
-    expect(campaignEndedSms("Back to school", 500000, 12)).not.toContain("bit.ly");
-  });
-});
-
-describe("support messages", () => {
-  it("supportReplySms names the ticket subject", () => {
-    expect(supportReplySms("Payout issue")).toContain("Payout issue");
-  });
-
-  it("supportReceivedSms carries ticket id + subject", () => {
-    const msg = supportReceivedSms(3, "Payout issue");
-    expect(msg).toContain("#3");
-    expect(msg).toContain("Payout issue");
+  it("accountLinkRequestSms names the requester and link type", () => {
+    const msg = accountLinkRequestSms("John Doe", "family", 42);
+    expect(msg).toContain("John Doe");
+    expect(msg).toContain("family");
   });
 });

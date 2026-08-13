@@ -3,15 +3,26 @@
 // in wrangler.toml.
 //
 // Every transaction (collection OR disbursement) carries the same platform fee:
-//   ZMW 0.2400 flat per transaction + 1% (K3 minimum)  -> "platform fee"
+//   ZMW 0.4800 flat per transaction + 1% (K3 minimum)  -> "platform fee"
 // plus Lipila's fee for that leg (2.5% collection / 1.5% disbursement).
 // The full amount is shown to users as one line: "Processing fees".
 //
 // Collection: customer pays platform + Lipila collection together on MoMo.
 // Disbursement: Lipila's payout fee (1.5%) and Kingdom Sponsor's payout cut
-// (K3 min / 1% + ZMW 0.24) are both deducted from the host's payout at payout time.
+// (K3 min / 1% + ZMW 0.48) are both deducted from the host's payout at payout time.
 
-export const PLATFORM_FIXED_FEE_CENTS = 24; // ZMW 0.2400 per transaction (collection and disbursement)
+export const PLATFORM_FIXED_FEE_CENTS = 48; // ZMW 0.4800 per transaction (collection and disbursement)
+
+/**
+ * Collision-proof reference for money flows. A bare millisecond timestamp can
+ * collide when two transactions hit the same campaign (or phone) in the same
+ * ms, which would silently corrupt webhook idempotency (two rows sharing one
+ * lipila_reference -> double-credit risk). We append a short random suffix.
+ */
+export function moneyRef(prefix: string, scopeId: number | string, time = Date.now()): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `${prefix}-${scopeId}-${time}-${rand}`;
+}
 
 export interface FeeConfig {
   platformPct: number;         // e.g. 1  -> 1% above the minimum
@@ -60,7 +71,7 @@ export function pctOf(cents: number, pct: number): number {
   return Math.round((cents * pct) / 100);
 }
 
-/** Donation -> fees taken from that donation. Platform fee is K3 min + ZMW 0.24 per tx, else pct. Always the real K3/1% + ZMW 0.24. Cards: K5 min / 2% + ZMW 0.24 + Lipila's card collection fee. */
+/** Donation -> fees taken from that donation. Platform fee is K3 min + ZMW 0.48 per tx, else pct. Always the real K3/1% + ZMW 0.48. Cards: K5 min / 2% + ZMW 0.48 + Lipila's card collection fee. */
 export function donationFees(amountCents: number, cfg: FeeConfig, method: "momo" | "card" = "momo") {
   if (method === "card") {
     const lipilaFeeCents = pctOf(amountCents, cfg.cardLipilaCollectionPct);
@@ -97,7 +108,7 @@ export function disbursementFeeCents(availableCents: number, cfg: FeeConfig): nu
   return pctOf(availableCents, cfg.lipilaDisbursementPct);
 }
 
-/** Kingdom Sponsor's payout cut: ZMW 0.24 + flat K3 minimum, or ZMW 0.24 + the platform pct when that is higher. */
+/** Kingdom Sponsor's payout cut: ZMW 0.48 + flat K3 minimum, or ZMW 0.48 + the platform pct when that is higher. */
 export function platformDisbursementFeeCents(availableCents: number, cfg: FeeConfig): number {
   return Math.max(
     cfg.platformMinFeeCents + PLATFORM_FIXED_FEE_CENTS,

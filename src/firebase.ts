@@ -72,7 +72,7 @@ export async function sendMulticastPush(
   title: string,
   body: string,
   data?: Record<string, string>
-): Promise<{ success: number; failure: number; failedTokens: string[] }> {
+): Promise<{ success: number; failure: number; failedTokens: string[]; bulkError?: boolean }> {
   if (!tokens.length) return { success: 0, failure: 0, failedTokens: [] };
 
   const payload = {
@@ -97,7 +97,8 @@ export async function sendMulticastPush(
           } else if (attempt < MAX_RETRIES) {
             // Will retry on next attempt
           } else {
-            failedTokens.push(tokens[i]);
+            // Per-token transient failure after retries: do NOT prune (the token
+            // may be fine next time). Only permanently-invalid tokens are pruned.
           }
           if (i < 3) console.error("FCM token error:", code || r.error.message);
         }
@@ -107,10 +108,13 @@ export async function sendMulticastPush(
       if (attempt < MAX_RETRIES) {
         await delay(RETRY_DELAY_MS * (attempt + 1));
       } else {
+        // Bulk failure (auth key, quota, network, etc.). Return NO failedTokens
+        // so callers don't prune every registered token — a broken credential
+        // or transient outage must never wipe the push database.
         console.error("FCM multicast failed after retries:", e);
-        return { success: 0, failure: tokens.length, failedTokens: tokens };
+        return { success: 0, failure: tokens.length, failedTokens: [], bulkError: true };
       }
     }
   }
-  return { success: 0, failure: tokens.length, failedTokens: tokens };
+  return { success: 0, failure: tokens.length, failedTokens: [], bulkError: true };
 }

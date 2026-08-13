@@ -307,3 +307,27 @@ export async function logLipilaEvent(
     console.error("lipila_log insert failed:", e);
   }
 }
+
+/** Flips a previously-"pending" lipila_log row to its final status once the
+ *  Lipila webhook confirms the transaction (success/failed). Keeps the admin
+ *  Lipila logs screen truthful instead of showing everything as pending. */
+export async function updateLipilaLogStatus(
+  db: D1Database | undefined,
+  referenceId: string,
+  status: "success" | "failed",
+  message?: string
+): Promise<void> {
+  if (!db || !referenceId) return;
+  try {
+    await db
+      .prepare(
+        `UPDATE lipila_logs SET status = ?, lipila_status = ?, message = COALESCE(?, message),
+                updated_at = datetime('now')
+         WHERE reference_id LIKE ? AND status IN ('pending', 'unknown', 'error')`
+      )
+      .bind(status, status, message ?? null, `${referenceId}%`)
+      .run();
+  } catch (e) {
+    console.error("lipila_log update failed:", e);
+  }
+}
