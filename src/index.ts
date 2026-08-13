@@ -2707,8 +2707,8 @@ app.post("/api/campaigns/:id/contribute-card", async (c) => {
   const referenceId = moneyRef("CON", Number(campaign.id));
 
   const r = await c.env.DB.prepare(
-    `INSERT INTO contributions (campaign_id, donor_user_id, donor_name, is_anonymous, hide_amount, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status, tier_name, ticket_qty)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+    `INSERT INTO contributions (campaign_id, donor_user_id, donor_name, is_anonymous, hide_amount, phone, email, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status, tier_name, ticket_qty)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
   ).bind(
     campaign.id,
     donor.id,
@@ -2716,6 +2716,7 @@ app.post("/api/campaigns/:id/contribute-card", async (c) => {
     body.isAnonymous ? 1 : 0,
     body.hideAmount ? 1 : 0,
     phone,
+    email || null,
     amountCents,
     fees.platformFeeCents,
     fees.lipilaFeeCents,
@@ -6032,6 +6033,9 @@ app.get("/api/admin/stats", async (c) => {
   const pendingAnnouncements = (await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM announcements WHERE status = 'pending'"
   ).first<{ n: number }>())?.n ?? 0;
+  const cardEmails = (await c.env.DB.prepare(
+    "SELECT COUNT(DISTINCT email) AS n FROM contributions WHERE email IS NOT NULL AND email != '' AND status = 'confirmed'"
+  ).first<{ n: number }>())?.n ?? 0;
 
   return c.json({
     stats: {
@@ -6068,6 +6072,7 @@ app.get("/api/admin/stats", async (c) => {
       ticketsSold: ticketSales.t,
       ticketsSoldValueCents: ticketSales.s,
       pendingAnnouncements,
+      cardEmails,
     },
     topCampaigns: topList,
     topDonors: topDonors.results.map((d) => ({
@@ -6867,6 +6872,44 @@ app.get("/api/admin/users", async (c) => {
       givenCents: u.given_cents ?? 0,
       invites: u.invites ?? 0,
       createdAt: u.created_at,
+    })),
+  });
+});
+
+/** Admin: list donor emails captured on card contributions (donations + tickets). */
+app.get("/api/admin/emails", async (c) => {
+  const staff = await requireStaff(c, "donations");
+  if (!staff) return c.json({ error: "Admin only" }, 403);
+
+  const q = String(c.req.query("q") ?? "").trim().slice(0, 80);
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "200", 10) || 200, 1), 1000);
+  const like = q ? `%${q}%` : null;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT co.email, COALESCE(co.donor_name, u.username, 'Giver') AS donor,
+            MAX(co.created_at) AS last_contribution,
+            COUNT(*) AS contributions,
+            SUM(co.amount_cents) AS total_cents
+     FROM contributions co
+     LEFT JOIN users u ON u.id = co.donor_user_id
+     WHERE co.email IS NOT NULL AND co.email != '' AND co.status = 'confirmed'
+       AND (? IS NULL OR co.email LIKE ? OR co.donor_name LIKE ?)
+     GROUP BY co.email, COALESCE(co.donor_name, u.username, 'Giver')
+     ORDER BY last_contribution DESC LIMIT ?`
+  ).bind(like, like, like, limit).all<Record<string, any>>();
+
+  const total = (await c.env.DB.prepare(
+    "SELECT COUNT(DISTINCT email) AS n FROM contributions WHERE email IS NOT NULL AND email != '' AND status = 'confirmed'"
+  ).first<{ n: number }>())?.n ?? 0;
+
+  return c.json({
+    total,
+    emails: rows.results.map((r) => ({
+      email: r.email,
+      donor: r.donor,
+      lastContribution: r.last_contribution,
+      contributions: r.contributions,
+      totalCents: r.total_cents ?? 0,
     })),
   });
 });
