@@ -691,19 +691,26 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
     "SELECT c.*, u.phone AS host_phone, u.id AS host_user_id FROM campaigns c JOIN users u ON u.id = c.host_user_id WHERE c.id = ?"
   ).bind(row.campaign_id).first<Record<string, any>>();
   const available = await availableBalance(env, row.campaign_id);
+  const isTicket = !!row.tier_name;
+  const noun = isTicket ? "event" : "campaign";
+  const title = campaign?.title ?? (isTicket ? "Your event" : "Your campaign");
   if (campaign?.host_phone) {
     await smsAndPush(env, campaign.host_user_id, campaign.host_phone,
       donationReceivedSms(campaign.title, row.amount_cents, available),
-      "New gift received",
-      `Someone gave ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign.title}".`,
+      isTicket ? "New ticket sold" : "New gift received",
+      isTicket
+        ? `Someone bought ${row.ticket_qty ?? 1} ${(row.ticket_qty ?? 1) === 1 ? "ticket" : "tickets"} (${row.tier_name}) for "${campaign.title}".`
+        : `Someone gave ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign.title}".`,
       { type: "donation_received", campaignId: String(campaign.id) });
   }
   if (row.phone) {
     await smsAndPush(env, row.donor_user_id, row.phone,
       donationConfirmedSms(campaign?.title ?? "campaign", row.amount_cents, referenceId),
-      "Gift confirmed",
-      `Thank you! Your gift of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${campaign?.title ?? "campaign"}" is confirmed.`,
-      { type: "donation_confirmed", campaignId: String(campaign?.id ?? ""), contributionId: String(row.id) });
+      isTicket ? "Ticket confirmed" : "Gift confirmed",
+      isTicket
+        ? `Your ${row.ticket_qty ?? 1} ${(row.ticket_qty ?? 1) === 1 ? "ticket" : "tickets"} for "${title}" ${(row.ticket_qty ?? 1) === 1 ? "is" : "are"} confirmed. See you at the event!`
+        : `Thank you! Your gift of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${title}" is confirmed.`,
+      { type: isTicket ? "ticket_confirmed" : "donation_confirmed", campaignId: String(campaign?.id ?? ""), contributionId: String(row.id) });
 
     // Donor joined notification: if this is the donor's first confirmed contribution.
     if (row.donor_user_id) {
@@ -714,16 +721,19 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
       ) === 1;
       if (firstCount) {
         await pushToUser(env, campaign?.host_user_id, "New donor joined",
-          `${campaign?.title ?? "Your campaign"} just received its first gift from a new supporter.`,
+          `${title} just received its first ${isTicket ? "ticket" : "gift"} from a new supporter.`,
           { type: "new_donor", campaignId: String(campaign?.id ?? "") })
           .catch((e) => console.error("new donor push failed:", e));
       }
     }
   }
 
-  // Alert the superadmin(s) about every confirmed donation.
-  await pushAdmins(env, "New donation",
-    `${(row.amount_cents / 100).toLocaleString()} ZMW given to "${campaign?.title ?? "campaign"}".`,
+  // Alert the admin team about every confirmed donation or ticket sale.
+  await pushAdmins(env,
+    isTicket ? "Ticket sold" : "New donation",
+    isTicket
+      ? `${(row.amount_cents / 100).toLocaleString()} ZMW from ${row.ticket_qty ?? 1} ${(row.ticket_qty ?? 1) === 1 ? "ticket" : "tickets"} (${row.tier_name}) for "${title}".`
+      : `${(row.amount_cents / 100).toLocaleString()} ZMW given to "${title}".`,
     { type: "donation", campaignId: String(campaign?.id ?? "") }).catch(() => {});
 
   // Milestone notifications: alert a campaign's donors when it crosses 25/50/75/100% of its goal.
@@ -2014,14 +2024,13 @@ app.get("/api/campaigns", async (c) => {
       ? "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.status = 'active' AND c.visibility = 'public' AND c.category = ? ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100"
       : "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.status = 'active' AND c.visibility = 'public' ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100"
   ).bind(...(category && isValidCategory(category) ? [category] : [])).all<Record<string, any>>();
-  const out = [];
-  for (const row of rows.results) {
+  const out = await Promise.all(rows.results.map(async (row) => {
     try {
-      out.push(await campaignPublic(c.env, row));
+      return await campaignPublic(c.env, row);
     } catch (e) {
       console.error(`campaignPublic failed for campaign ${row.id}:`, e);
       // Include minimal campaign data so the list still shows
-      out.push({
+      return {
         id: row.id, slug: row.slug, title: row.title, description: row.description,
         blurb: String(row.description ?? "").slice(0, 140), imageUrl: row.image_url,
         logoUrl: row.logo_url ?? null, goalCents: Number(row.goal_cents),
@@ -2031,9 +2040,9 @@ app.get("/api/campaigns", async (c) => {
         promoted: !!row.promoted, promotedUntil: row.promoted_until ?? null,
         status: row.status, category: row.category ?? "Other",
         createdAt: row.created_at, shareUrl: null,
-      });
+      };
     }
-  }
+  }));
 
   // Batch-shorten share URLs (1 SELECT for existing + INSERTs only for new
   // campaigns) so the hot list path stays cheap and users never see the raw
@@ -2077,14 +2086,13 @@ app.get("/api/campaigns/search", async (c) => {
             OR u.username LIKE ? OR COALESCE(u.host_org,'') LIKE ?)
      ORDER BY c.promoted DESC, c.created_at DESC LIMIT 50`
   ).bind(like, like, like, like, like).all<Record<string, any>>();
-  const out = [];
-  for (const row of rows.results) {
-    try {
-      out.push(await campaignPublic(c.env, row));
-    } catch (e) {
-      console.error(`campaignPublic failed for ${row.id} during search:`, e);
-    }
-  }
+  const out = (await Promise.allSettled(rows.results.map((row) => campaignPublic(c.env, row))))
+    .map((r) => {
+      if (r.status === "fulfilled") return r.value;
+      console.error("campaignPublic failed during search:", r.reason);
+      return null;
+    })
+    .filter((v): v is Record<string, any> => v != null);
   return c.json({ campaigns: out });
 });
 
@@ -2343,15 +2351,18 @@ app.post("/api/campaigns", async (c) => {
   if (pastDonors.results.length && envPushConfigured(c.env)) {
     const tokens = pastDonors.results.map((u) => u.token);
     const donorIds = pastDonors.results.map((u) => u.user_id);
-    await sendMulticastPush(fbEnv(c.env), tokens, "New campaign posted",
-      `${user.username ?? "Someone you support"} just started "${title}". Give now on Kingdom Sponsor.`,
-      { type: "new_campaign", campaignId: String(campaignId) }
+    const isEvent = campaignType === "event";
+    const pushTitle = isEvent ? "New event posted" : "New campaign posted";
+    const pushBody = isEvent
+      ? `${user.username ?? "Someone you support"} just listed "${title}". Get tickets on Kingdom Sponsor.`
+      : `${user.username ?? "Someone you support"} just started "${title}". Give now on Kingdom Sponsor.`;
+    await sendMulticastPush(fbEnv(c.env), tokens, pushTitle, pushBody,
+      { type: isEvent ? "new_event" : "new_campaign", campaignId: String(campaignId) }
     ).catch((e) => console.error("new campaign push failed:", e));
     for (const uid of new Set(donorIds)) {
-      await recordNotification(c.env, uid, "new_campaign",
-        "New campaign posted",
-        `${user.username ?? "Someone you support"} just started "${title}". Give now on Kingdom Sponsor.`,
-        { type: "new_campaign", campaignId: String(campaignId) }).catch(() => {});
+      await recordNotification(c.env, uid, isEvent ? "new_event" : "new_campaign",
+        pushTitle, pushBody,
+        { type: isEvent ? "new_event" : "new_campaign", campaignId: String(campaignId) }).catch(() => {});
     }
   }
   }
@@ -2454,13 +2465,14 @@ app.put("/api/admin/campaigns/:id", async (c) => {
     ).bind(campaign.id).all<{ token: string; user_id: number }>();
     if (donors.results.length && envPushConfigured(c.env)) {
       const tokens = donors.results.map((u) => u.token);
-      await sendMulticastPush(fbEnv(c.env), tokens, "Campaign updated",
-        `"${title ?? campaign.title}" has been updated by the host.`,
+      const isEvent = campaign.campaign_type === "event";
+      const pushTitle = isEvent ? "Event updated" : "Campaign updated";
+      const pushBody = `"${title ?? campaign.title}" has been updated by the host.`;
+      await sendMulticastPush(fbEnv(c.env), tokens, pushTitle, pushBody,
         { type: "campaign_updated", campaignId: String(campaign.id) }
       ).catch((e) => console.error("campaign-updated push failed:", e));
       for (const uid of new Set(donors.results.map((d) => d.user_id))) {
-        await recordNotification(c.env, uid, "campaign_updated", "Campaign updated",
-          `"${title ?? campaign.title}" has been updated by the host.`,
+        await recordNotification(c.env, uid, "campaign_updated", pushTitle, pushBody,
           { type: "campaign_updated", campaignId: String(campaign.id) }).catch(() => {});
       }
     }
@@ -3894,17 +3906,25 @@ app.post("/api/campaigns/:id/live", async (c) => {
 app.get("/api/campaigns/:id/live/donations", async (c) => {
   const id = Number(c.req.param("id"));
   const rows = await c.env.DB.prepare(
-    `SELECT co.amount_cents, co.donor_name, co.is_anonymous, u.username, co.created_at
+    `SELECT co.amount_cents, co.donor_name, co.is_anonymous, co.hide_amount, u.username, co.created_at
      FROM contributions co LEFT JOIN users u ON u.id = co.donor_user_id
      WHERE co.campaign_id = ? AND co.status = 'confirmed'
      ORDER BY co.created_at DESC LIMIT 25`
   ).bind(id).all<Record<string, any>>();
   return c.json({
-    donations: rows.results.map((r) => ({
-      amountCents: r.amount_cents,
-      name: r.is_anonymous ? "Anonymous" : (r.donor_name || r.username || "Giver"),
-      createdAt: r.created_at,
-    })),
+    donations: rows.results.map((r) => {
+      const anonymous = !!r.is_anonymous;
+      const hideAmount = !!r.hide_amount;
+      return {
+        // Never leak a name the donor chose to keep private…
+        name: anonymous ? "Anonymous" : (r.donor_name || r.username || "Giver"),
+        // …and never leak an amount the donor hid. Show a dot instead so the
+        // live feed stays lively without exposing hidden figures.
+        amountCents: hideAmount ? null : r.amount_cents,
+        hidden: hideAmount,
+        createdAt: r.created_at,
+      };
+    }),
   });
 });
 
@@ -5413,11 +5433,10 @@ app.get("/api/host/me", async (c) => {
   const campaigns = await c.env.DB.prepare(
     "SELECT * FROM campaigns WHERE host_user_id = ? AND status != 'deleted' ORDER BY created_at DESC"
   ).bind(user.sub).all<Record<string, any>>();
-  const out = [];
-  for (const row of campaigns.results) {
+  const out = await Promise.all(campaigns.results.map(async (row) => {
     const available = await availableBalance(c.env, row.id);
-    out.push({ ...(await campaignPublic(c.env, row)), availableCents: available, minWithdrawCents: row.min_withdraw_cents });
-  }
+    return { ...(await campaignPublic(c.env, row)), availableCents: available, minWithdrawCents: row.min_withdraw_cents };
+  }));
 
   const transactions = await c.env.DB.prepare(
     `SELECT co.id, co.campaign_id, c.title AS campaign_title, co.donor_name, co.is_anonymous, co.phone, co.amount_cents,
@@ -5966,10 +5985,7 @@ app.get("/api/admin/stats", async (c) => {
   const topCampaigns = await c.env.DB.prepare(
     "SELECT * FROM campaigns ORDER BY id DESC LIMIT 5"
   ).all<Record<string, any>>();
-  const topList = [];
-  for (const row of topCampaigns.results) {
-    topList.push(await campaignPublic(c.env, row));
-  }
+  const topList = await Promise.all(topCampaigns.results.map((row) => campaignPublic(c.env, row)));
 
   const topDonors = await c.env.DB.prepare(
     `SELECT u.username, SUM(co.amount_cents) AS total
@@ -6227,10 +6243,13 @@ app.get("/api/search", async (c) => {
        AND (c.title LIKE ? OR c.description LIKE ? OR c.category LIKE ?)
      ORDER BY c.promoted DESC, c.created_at DESC LIMIT 20`
   ).bind(like, like, like).all<Record<string, any>>();
-  const campaignOut = [];
-  for (const row of campaigns.results) {
-    try { campaignOut.push(await campaignPublic(c.env, row)); } catch (e) { console.error("search campaign fail", e); }
-  }
+  const campaignOut = (await Promise.allSettled(campaigns.results.map((row) => campaignPublic(c.env, row))))
+    .map((r) => {
+      if (r.status === "fulfilled") return r.value;
+      console.error("search campaign fail", r.reason);
+      return null;
+    })
+    .filter((v): v is Record<string, any> => v != null);
 
   // The rest requires auth; richer data requires admin.
   const user = await authUser(c);
@@ -6992,12 +7011,11 @@ app.get("/api/admin/campaigns", async (c) => {
      JOIN users u ON u.id = cam.host_user_id ORDER BY cam.created_at DESC`
   ).all<Record<string, any>>();
 
-  const out = [];
-  for (const row of rows.results) {
+  const out = await Promise.all(rows.results.map(async (row) => {
     const pub = await campaignPublic(c.env, row);
     const available = await availableBalance(c.env, row.id);
-    out.push({ ...pub, hostUsername: row.host_username, availableCents: available, minWithdrawCents: row.min_withdraw_cents });
-  }
+    return { ...pub, hostUsername: row.host_username, availableCents: available, minWithdrawCents: row.min_withdraw_cents };
+  }));
   return c.json({ campaigns: out });
 });
 
