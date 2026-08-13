@@ -1979,21 +1979,26 @@ async function campaignPublic(env: Bindings, row: Record<string, any>, authUserI
 }
 
 /** Parses the campaign's event ticket tiers (JSON) into a safe array. */
-function parseEventTiers(raw: unknown): { name: string; amountCents: number }[] {
+export function parseEventTiers(raw: unknown): { name: string; amountCents: number }[] {
   if (!raw) return [];
-  try {
-    const parsed = JSON.parse(String(raw));
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((t) => ({
-        name: String(t?.name ?? "").trim().slice(0, 60),
-        amountCents: Math.max(0, Math.round(Number(t?.amountCents) || 0)),
-      }))
-      .filter((t) => t.name && t.amountCents > 0)
-      .slice(0, 10);
-  } catch {
-    return [];
+  let parsed: unknown = raw;
+  // Accept both a JSON string ("[{"name":"Standard","amountCents":20000}]")
+  // and an already-parsed array (what the Flutter app sends in the body).
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
   }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((t) => ({
+      name: String(t?.name ?? "").trim().slice(0, 60),
+      amountCents: Math.max(0, Math.round(Number(t?.amountCents) || 0)),
+    }))
+    .filter((t) => t.name && t.amountCents > 0)
+    .slice(0, 10);
 }
 
 // ---------- campaign categories ----------
