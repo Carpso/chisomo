@@ -77,12 +77,36 @@ Admins change all of the following from the dashboard; the app reads them live:
 - Network status / SMS notice / intruder / Telegram / email: admin-dashboard settings
 - Sample images: `GET /api/sample-images` (public), `GET/POST/DELETE /api/admin/sample-images` (settings scope)
 
+## Airtime Provider (pluggable supplier seam)
+
+`src/airtime.ts` abstracts the airtime supplier behind `sendAirtime()` / `getAirtimeProvider()`.
+The app (order → payment → fulfilment → refund) never calls a provider directly.
+**Africa's Talking does NOT offer the airtime product for Zambia** — the default is
+`manual` (orders queue; admin tops up by hand and confirms from the dashboard).
+
+Providers (`AIRTIME_PROVIDER` var, redeploy to switch):
+- `manual` (default) — no real send; orders marked `sent` then completed via
+  `POST /api/admin/airtime-orders/:id/complete`.
+- `mtn_momo` — MTN MoMo API airtime product (the route for Zambia). Needs secrets
+  `MTN_MOMO_SUBSCRIPTION_KEY`, `MTN_MOMO_API_USER`, `MTN_MOMO_API_KEY`; vars
+  `MTN_MOMO_TARGET_ENV` (sandbox | mtnzambia | ...), `MTN_MOMO_BASE_URL`
+  (sandbox.momodeveloper.mtn.com | proxy.momoapi.mtn.com). 202 → queued; a status
+  callback to `providerCallbackHost` confirms delivery.
+- `africastalking` — AT airtime API (only for non-Zambia markets).
+
+Endpoints: `GET /api/airtime/providers` (public list + current), admin test
+`POST /api/admin/airtime/test` is provider-aware (reports provider; manual mode
+returns a notice instead of sending).
+
 ## New Endpoints
 
 ### Airtime System
 - `GET /api/airtime/config` — public config (enabled, limits)
+- `GET /api/airtime/providers` — public provider list + current
 - `POST /api/airtime/order` — create order (auth)
 - `PUT /api/admin/airtime/config` — admin update settings
+- `POST /api/admin/airtime-orders/:id/complete` — mark a manual-mode order delivered
+- `POST /api/admin/airtime/test` — provider-aware K1 test top-up
 
 ### Host Badge System
 - `GET /api/host/badge-config` — pricing tiers

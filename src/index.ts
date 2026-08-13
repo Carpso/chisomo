@@ -7,7 +7,8 @@ import { cors } from "hono/cors";
 import * as Sentry from "@sentry/cloudflare";
 import { signToken, verifyToken, sha256Hex, type TokenPayload } from "./jwt";
 import { createCollection, createCardCollection, checkCollectionStatus, checkDisbursementStatus, createDisbursement, getWalletBalance, logLipilaEvent, updateLipilaLogStatus, lipilaBase, type LipilaEnv } from "./lipila";
-import { sendOtpSms, sendSms, sendAirtime, clampSms } from "./sms";
+import { sendOtpSms, sendSms, clampSms } from "./sms";
+import { sendAirtime, getAirtimeProvider, airtimeProviders, type AirtimeEnv } from "./airtime";
 import { loadFeeConfig, donationFees, payoutAmountCents, disbursementFeeCents, platformDisbursementFeeCents, feeConfigPublic, formatKwacha, moneyRef } from "./fees";
 import { generateUsername, ensureUser, donorTotalCents, donorVisibleCents, tierFor } from "./donors";
 import { sendPushNotification, sendMulticastPush } from "./firebase";
@@ -26,7 +27,7 @@ const CAMPAIGN_TYPES = [
 /** Valid KYC document types a host can submit for vetting. */
 const HOST_KYC_TYPES = ["nrc", "ngo_cert", "endorsement"] as const;
 
-type Bindings = LipilaEnv & SmsEnv2 & {
+type Bindings = LipilaEnv & SmsEnv2 & AirtimeEnv & {
   DB: D1Database;
   MEDIA: R2Bucket;
   JWT_SECRET: string;
@@ -8150,6 +8151,11 @@ app.get("/api/airtime/config", async (c) => {
   });
 });
 
+// Get airtime provider list (public - shows which supplier is configured).
+app.get("/api/airtime/providers", async (c) => {
+  return c.json({ providers: airtimeProviders(), current: getAirtimeProvider(c.env).id });
+});
+
 // Create airtime order (payment collected via Lipila MoMo prompt, then
 // fulfilled through Africa's Talking airtime API by the webhook/cron).
 app.post("/api/airtime/order", async (c) => {
@@ -8239,25 +8245,35 @@ app.post("/api/airtime/order", async (c) => {
 
 // ---------- airtime fulfillment ----------
 
-/** Deliver airtime for a paid order via Africa's Talking (real in production).
- *  Moves the order to `sent` and stores the AT requestId so the AT status
- *  callback can confirm real MNO delivery the instant it arrives. */
+/** Deliver airtime for a paid order through the configured provider
+ *  (MTN MoMo for Zambia; Africa's Talking for other markets; manual = admin
+ *  fulfils by hand). Moves the order to `sent` and stores the provider's
+ *  requestId so the status callback can confirm real MNO delivery. */
 async function fulfillAirtimeOrder(env: Bindings, orderId: number): Promise<void> {
   const order = await env.DB.prepare("SELECT * FROM airtime_orders WHERE id = ?")
     .bind(orderId).first<Record<string, any>>();
   if (!order || order.status !== "paid") return;
   try {
-    const res = await sendAirtime(env, order.phone, order.amount_cents / 100);
-    const requestId = String(res?.responses?.[0]?.requestId ?? "").trim();
+    const provider = getAirtimeProvider(env);
+    const requestId = await sendAirtime(env, order.phone, order.amount_cents / 100);
     await env.DB.prepare(
       "UPDATE airtime_orders SET status = 'sent', at_request_id = ?, sent_at = datetime('now', '+2 hours'), completed_at = NULL, error = NULL WHERE id = ?"
     ).bind(requestId || null, orderId).run();
-    const msg = airtimeSentSms(order.amount_cents);
-    const user = await env.DB.prepare("SELECT phone FROM users WHERE id = ?")
-      .bind(order.user_id).first<{ phone: string }>();
-    await smsAndPush(env, order.user_id, user?.phone ?? null, msg,
-      "Airtime sent", `Your airtime order for ${order.phone} has been submitted.`, { type: "airtime_sent" });
-    console.log("[AIRTIME] order", orderId, "sent; requestId =", requestId, JSON.stringify(res).slice(0, 200));
+    // Manual provider has no status callback: if we're using it, the admin
+    // confirms delivery from the dashboard (never auto-complete).
+    if (provider.id !== "manual") {
+      const msg = airtimeSentSms(order.amount_cents);
+      const user = await env.DB.prepare("SELECT phone FROM users WHERE id = ?")
+        .bind(order.user_id).first<{ phone: string }>();
+      await smsAndPush(env, order.user_id, user?.phone ?? null, msg,
+        "Airtime sent", `Your airtime order for ${order.phone} has been submitted.`, { type: "airtime_sent" });
+    } else {
+      const user = await env.DB.prepare("SELECT phone FROM users WHERE id = ?")
+        .bind(order.user_id).first<{ phone: string }>();
+      await smsAndPush(env, order.user_id, user?.phone ?? null, `KSPONSOR: Your ${formatKwacha(order.amount_cents)} airtime order for ${order.phone} is being processed by our team.`,
+        "Airtime processing", `Your airtime order for ${order.phone} is being processed.`, { type: "airtime_sent" });
+    }
+    console.log("[AIRTIME] order", orderId, "sent via", provider.id, "; requestId =", requestId);
   } catch (e) {
     const msg = String(e instanceof Error ? e.message : e).slice(0, 500);
     const lower = msg.toLowerCase();
@@ -8476,6 +8492,26 @@ app.post("/api/admin/airtime-orders/:id/retry", async (c) => {
   return c.json({ ok: true, status: after?.status ?? "paid", error: after?.error ?? null });
 });
 
+/** Admin: mark a MANUAL-mode order as delivered after the admin topped up the
+ *  phone by hand. Completes the order and notifies the buyer. */
+app.post("/api/admin/airtime-orders/:id/complete", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const id = Number(c.req.param("id"));
+  const order = await c.env.DB.prepare(
+    `SELECT o.*, u.phone AS user_phone FROM airtime_orders o JOIN users u ON u.id = o.user_id WHERE o.id = ?`
+  ).bind(id).first<Record<string, any>>();
+  if (!order) return c.json({ error: "Order not found" }, 404);
+  if (order.status === "completed") return c.json({ error: "Already delivered" }, 400);
+  await c.env.DB.prepare(
+    "UPDATE airtime_orders SET status = 'completed', delivered_at = datetime('now', '+2 hours'), error = NULL WHERE id = ?"
+  ).bind(id).run();
+  const msg = airtimeDeliveredSms(order.amount_cents);
+  await smsAndPush(c.env, order.user_id, order.user_phone ?? null, msg,
+    "Airtime delivered", `Your airtime has been delivered to ${order.phone}.`, { type: "airtime_delivered" });
+  return c.json({ ok: true, message: `Marked ${formatKwacha(order.amount_cents)} airtime as delivered.` });
+});
+
 /** Admin: refund a failed airtime order's cost back to the buyer's mobile
  *  money (used when AT could never deliver, e.g. the product is disabled). */
 app.post("/api/admin/airtime-orders/:id/refund", async (c) => {
@@ -8518,8 +8554,8 @@ app.post("/api/admin/airtime-orders/:id/refund", async (c) => {
   return c.json({ ok: true, message: `Refund of ${formatKwacha(order.cost_cents)} initiated to ${order.user_phone}` });
 });
 
-// Admin: verify Africa's Talking airtime credentials by sending a real
-// K1 top-up to a provided Zambian number. Also reports AT account status.
+// Admin: verify the configured airtime provider credentials by sending a real
+// K1 top-up to a provided Zambian number. Reports the active provider + status.
 app.post("/api/admin/airtime/test", async (c) => {
   const admin = await requireStaff(c, "settings");
   if (!admin) return c.json({ error: "Admin only" }, 403);
@@ -8532,22 +8568,29 @@ app.post("/api/admin/airtime/test", async (c) => {
   if (!validPhone) {
     return c.json({ error: "Enter a valid Zambian phone number (e.g. +260 977 123 456)." }, 400);
   }
-  if (!c.env.AT_API_KEY || !c.env.AT_USERNAME) {
-    return c.json({ error: "Africa's Talking credentials not configured on the worker." }, 500);
+  const provider = getAirtimeProvider(c.env);
+  if (provider.id === "manual") {
+    return c.json({
+      ok: true,
+      provider: provider.id,
+      message: "Airtime is in manual mode — no supplier is wired up yet. Orders are queued for manual fulfilment.",
+      sandbox: true,
+    });
   }
   const e164 = digits.startsWith("260") ? `+${digits}` : `+260${digits.slice(1)}`;
   try {
-    const res = await sendAirtime(c.env, e164, 1);
-    await logLipilaEvent(c.env.DB, "airtime_test", `TEST-${Date.now()}`, e164, 100, JSON.stringify(res).slice(0, 500));
+    const requestId = await sendAirtime(c.env, e164, 1);
+    await logLipilaEvent(c.env.DB, "airtime_test", `TEST-${Date.now()}`, e164, 100, `provider=${provider.id} requestId=${requestId}`);
     return c.json({
       ok: true,
-      message: "K1 airtime sent � check the recipient phone for delivery.",
-      response: res,
+      provider: provider.id,
+      message: "K1 airtime sent — check the recipient phone for delivery.",
+      requestId,
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    await logLipilaEvent(c.env.DB, "airtime_test", `TEST-${Date.now()}`, e164, 100, msg);
-    return c.json({ error: `Airtime test failed: ${msg}` }, 502);
+    await logLipilaEvent(c.env.DB, "airtime_test", `TEST-${Date.now()}`, e164, 100, `provider=${provider.id}: ${msg}`);
+    return c.json({ error: `Airtime test failed (${provider.id}): ${msg}` }, 502);
   }
 });
 

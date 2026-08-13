@@ -4,7 +4,7 @@
 **Version**: 0.7.0 (versionCode 75)
 **Flutter Commit**: `3586782` (+ latest unpushed)
 **Backend Commit**: `dbfc5c4` (+ latest unpushed)
-**Backend Deployed Version ID**: `1c7e0913-fb8e-48b1-9de5-5a5416763b44`
+**Backend Deployed Version ID**: `57ae8a7a-0ca2-4c2c-b254-e19ab4e8f9de`
 
 ---
 
@@ -264,15 +264,24 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
 
 ## Next Session Checklist
 
-1. Verify push notifications arrive on a real device (test via Settings → Test notification — it now force-refreshes stale FCM tokens and retries; if it still shows "0 of 1 device", the phone's POST_NOTIFICATIONS permission is off)
-2. Confirm announcements moderation works end-to-end (host posts → admin approves → donors pushed)
-3. Confirm assistant account can log in and sees only its scoped tiles
-4. Upload `app-release.aab` (0.7.0/75) to the Play Console
-5. Real-device QA on give-money + buy-ticket for MTN and Airtel
-6. Consider funding airtime + enabling it, and starting the Apple developer account for iOS
-7. Re-run migration_v44's app_settings inserts on any fresh DB (already applied to production; the ALTER TABLE part fails on re-run so apply the settings separately)
+1. **Wire up a real airtime provider** (AT doesn't support Zambia): get an MTN MoMo API
+   subscription (momoapi.mtn.com), set `AIRTIME_PROVIDER=mtn_momo` + `MTN_MOMO_*` secrets/vars,
+   redeploy, then use the admin airtime screen's "Test airtime delivery" to verify a real K1 top-up.
+   Until then airtime stays in `manual` mode (admin fulfils + confirms).
+2. Verify push notifications arrive on a real device (test via Settings → Test notification — it now force-refreshes stale FCM tokens and retries; if it still shows "0 of 1 device", the phone's POST_NOTIFICATIONS permission is off)
+3. Confirm announcements moderation works end-to-end (host posts → admin approves → donors pushed)
+4. Confirm assistant account can log in and sees only its scoped tiles
+5. Upload `app-release.aab` (0.7.0/75) to the Play Console
+6. Real-device QA on give-money + buy-ticket for MTN and Airtel
+7. Consider starting the Apple developer account for iOS
+8. Re-run migration_v44's app_settings inserts on any fresh DB (already applied to production; the ALTER TABLE part fails on re-run so apply the settings separately)
 
 ## Recent session highlights (0.7.0 hardening pass)
+- **Airtime provider layer (pluggable)**: AT does NOT offer airtime for Zambia, so
+  `src/airtime.ts` now abstracts suppliers — `manual` (default; admin fulfils by hand +
+  `POST /api/admin/airtime-orders/:id/complete`), `mtn_momo` (MTN MoMo API airtime, the
+  Zambia route), `africastalking` (other markets). New `GET /api/airtime/providers`;
+  admin test is provider-aware; admin airtime screen shows a provider badge.
 - **Push banners fixed**: Settings → Test notification force-refreshes the FCM token when FCM reports 0 deliveries; backend test-push reports honest sentCount; `giving_updates` channel self-heals; FCM payload pins channelId + high priority + public visibility + sound.
 - **Event finder's commission**: admin-set K10 (MoMo + card) deducted from event ticket host payouts on top of the normal cut + Lipila 1.5%; per-event waive (`waive_event_fees`); all editable from Admin → Fees & commissions. Migration v44.
 - **Remote config**: fees (platform %/min/fixed, MoMo + card), airtime, badge, promotions, referral threshold, sample images — all changeable from the dashboard without redeploying (app_settings).

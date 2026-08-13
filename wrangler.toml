@@ -39,6 +39,9 @@ bucket_name = "kingdom-sponsor-media"
 ENV = "production"              # SMS + OTP mode: "sandbox" shows debug code in API, "production" sends real AT SMS
 AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (not user-facing; used in the AT API call)
 AT_FROM = "KSPONSOR"      # approved AT sender ID — used for ALL SMS (OTP + notifications)
+AIRTIME_PROVIDER = "manual"     # airtime supplier: mtn_momo (Zambia route) | africastalking | manual (default = admin fulfils by hand)
+MTN_MOMO_TARGET_ENV = "sandbox" # MTN MoMo target environment: sandbox | mtnzambia | mtn_za ... (see MTN docs)
+# MTN_MOMO_BASE_URL = "https://sandbox.momodeveloper.mtn.com"
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
 APP_URL = "https://kingdom-sponsor-api.godfreymoseskalambo.workers.dev"
 # CORS_ORIGINS - extra HTTPS origins allowed to call the API from a browser
