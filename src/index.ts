@@ -6286,6 +6286,14 @@ app.get("/api/admin/stats", async (c) => {
     "SELECT COUNT(DISTINCT email) AS n FROM contributions WHERE email IS NOT NULL AND email != '' AND status = 'confirmed'"
   ).first<{ n: number }>())?.n ?? 0;
 
+  // Sponsor Desk coverage: how many opportunities exist / are published / active.
+  const sponsorDesk = (await c.env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM sponsor_desk) AS total,
+       (SELECT COUNT(*) FROM sponsor_desk WHERE published = 1) AS published,
+       (SELECT COUNT(*) FROM sponsor_desk WHERE status = 'active' AND published = 1) AS active`
+  ).first<{ total: number; published: number; active: number }>()) ?? { total: 0, published: 0, active: 0 };
+
   return c.json({
     stats: {
       totalRaisedCents: total.s,
@@ -6322,6 +6330,9 @@ app.get("/api/admin/stats", async (c) => {
       ticketsSoldValueCents: ticketSales.s,
       pendingAnnouncements,
       cardEmails,
+      sponsorDeskTotal: sponsorDesk.total,
+      sponsorDeskPublished: sponsorDesk.published,
+      sponsorDeskActive: sponsorDesk.active,
     },
     topCampaigns: topList,
     topDonors: topDonors.results.map((d) => ({
@@ -7567,6 +7578,10 @@ app.post("/api/admin/sponsor-desk/publish", async (c) => {
     await recordNotification(c.env, host.id, "sponsor_desk", title,
       `${picked.length} new grant/empowerment opportunities are on your Sponsor Desk.`, { type: "sponsor_desk" });
   }
+  // Let the team know the batch went out (and who published it).
+  await pushAdmins(c.env, "Sponsor Desk published",
+    `${picked.length} opportunities sent to ${hostRows.results.length} active hosts.`,
+    { type: "sponsor_desk" }).catch(() => {});
   return c.json({ ok: true, published: picked.length, hostsNotified: hostRows.results.length, sentCount });
 });
 
