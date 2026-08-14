@@ -4142,6 +4142,41 @@ app.post("/api/admin/push/test", async (c) => {
   return c.json({ ok: true, sentCount: result.success, total: tokens.length });
 });
 
+/** Admin: send a test push to ANY user by id (used from the push-reachability
+ *  screen to verify a specific phone actually receives a notification). */
+app.post("/api/admin/push/test-user", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const userId = Number(body.userId) || 0;
+  if (!userId) return c.json({ error: "userId required" }, 400);
+  if (!envPushConfigured(c.env)) return c.json({ error: "Push not configured (FIREBASE secrets missing)" }, 503);
+  const user = await c.env.DB.prepare(
+    "SELECT id, username, name, phone FROM users WHERE id = ?"
+  ).bind(userId).first<{ id: number; username: string; name: string | null; phone: string }>();
+  if (!user) return c.json({ error: "User not found" }, 404);
+  const rows = await c.env.DB.prepare(
+    "SELECT token FROM device_tokens WHERE user_id = ?"
+  ).bind(userId).all<{ token: string }>();
+  const tokens = rows.results.map((r) => r.token);
+  if (!tokens.length) {
+    return c.json({ ok: false, error: "No device registered on this account yet — they need to open the app once to register.", sentCount: 0 }, 200);
+  }
+  const result = await sendMulticastPush(fbEnv(c.env), tokens, "Kingdom Sponsor test",
+    "Your notifications are working — sent by your admin team. Check your phone!", { type: "test" })
+    .catch((e) => { console.error("test-user push failed:", e); return { success: 0, failure: tokens.length, failedTokens: tokens as string[] }; });
+  if (result.failedTokens.length) await pruneInvalidTokens(c.env, result.failedTokens);
+  await recordNotification(c.env, userId, "test", "Kingdom Sponsor test",
+    "Your notifications are working — sent by your admin team.", { type: "test" });
+  const name = user.name || user.username || user.phone;
+  return c.json({
+    ok: true,
+    message: `Test push sent to ${name}: ${result.success} of ${tokens.length} device${tokens.length === 1 ? "" : "s"} delivered.`,
+    sentCount: result.success,
+    total: tokens.length,
+  });
+});
+
 /** User: send a test push to your own devices (notification diagnostics). */
 app.post("/api/user/push/test", async (c) => {
   const user = await authUser(c);
@@ -8098,6 +8133,47 @@ app.get("/api/admin/push-status", async (c) => {
     totalTokens: tokenCount?.n ?? 0,
     usersWithTokens: usersWithTokens?.n ?? 0,
     pendingWithdrawals: pendingWithdrawals?.n ?? 0,
+  });
+});
+
+/** Admin: per-user push reachability — who has a registered device token (can
+ *  be pushed even with the app closed) vs. who hasn't opened the app yet. */
+app.get("/api/admin/push-users", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const q = String(c.req.query("q") ?? "").trim().slice(0, 60);
+  const like = `%${q}%`;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT u.id, u.phone, u.username, u.name, u.host_status, u.created_at, u.last_login_at,
+            u.notifications_enabled,
+            (SELECT COUNT(*) FROM device_tokens dt WHERE dt.user_id = u.id) AS token_count,
+            (SELECT MAX(dt.last_seen_at) FROM device_tokens dt WHERE dt.user_id = u.id) AS token_last_seen_at
+     FROM users u
+     WHERE ? = '' OR u.phone LIKE ? OR u.username LIKE ? OR COALESCE(u.name,'') LIKE ?
+     ORDER BY token_count DESC, u.created_at DESC
+     LIMIT 300`
+  ).bind(q, like, like, like).all<Record<string, any>>();
+
+  return c.json({
+    users: rows.results.map((u) => ({
+      id: u.id,
+      phone: u.phone,
+      username: u.username ?? "Giver",
+      name: u.name ?? null,
+      hostStatus: u.host_status ?? "none",
+      createdAt: u.created_at,
+      lastLoginAt: u.last_login_at ?? null,
+      notificationsEnabled: u.notifications_enabled == 1,
+      tokenCount: u.token_count ?? 0,
+      tokenLastSeenAt: u.token_last_seen_at ?? null,
+      reachable: (u.token_count ?? 0) > 0,
+    })),
+    summary: {
+      total: rows.results.length,
+      reachable: rows.results.filter((u) => (u.token_count ?? 0) > 0).length,
+      notReachable: rows.results.filter((u) => (u.token_count ?? 0) === 0).length,
+    },
   });
 });
 
