@@ -743,19 +743,28 @@ async function confirmContribution(env: Bindings, referenceId: string): Promise<
   await maybeAutoDisburse(env, row.campaign_id);
 }
 
-const MILESTONES = [0.25, 0.5, 0.75, 1];
+const MILESTONES = [25, 50, 75, 100];
+
+/** Milestone thresholds (whole percentages) — editable by admins via app_settings. */
+async function milestoneThresholds(env: Bindings): Promise<number[]> {
+  const raw = await getSetting(env, "milestone_thresholds");
+  if (!raw) return MILESTONES;
+  const parsed = raw.split(",").map((s) => Number(s.trim())).filter((n) => n > 0 && n <= 100);
+  return parsed.length ? [...new Set(parsed)].sort((a, b) => a - b) : MILESTONES;
+}
 
 /** Push + SMS the campaign's donors when a goal milestone is crossed. */
 async function maybeNotifyMilestones(env: Bindings, campaign: Record<string, any> | null, raisedBefore: number, addedCents: number): Promise<void> {
   if (!campaign || !campaign.goal_cents || campaign.goal_cents <= 0) return;
   const after = raisedBefore + addedCents;
-  const beforePct = raisedBefore / campaign.goal_cents;
-  const afterPct = after / campaign.goal_cents;
+  const beforePct = (raisedBefore / campaign.goal_cents) * 100;
+  const afterPct = (after / campaign.goal_cents) * 100;
+  const thresholds = await milestoneThresholds(env);
 
-  const crossed = MILESTONES.filter((m) => beforePct < m && afterPct >= m);
+  const crossed = thresholds.filter((m) => beforePct < m && afterPct >= m);
   if (!crossed.length) return;
 
-  const pct = Math.round(crossed[crossed.length - 1] * 100);
+  const pct = Math.round(crossed[crossed.length - 1]);
   const title = `"${campaign.title}" reached ${pct}%`;
   const body = `It's ${pct}% of its ${(campaign.goal_cents / 100).toLocaleString()} ZMW goal. Keep the momentum going!`;
 
@@ -1265,6 +1274,102 @@ async function runCampaignEndingAlerts(env: Bindings): Promise<void> {
   }
 }
 
+/** Hourly cron: push 48h and 2h countdown reminders to an event's ticket
+ *  holders (and the host) so they never miss it. Each bucket fires once per
+ *  event (tracked by event_remind_48h / event_remind_2h flags). */
+async function runEventReminders(env: Bindings): Promise<void> {
+  if (!envPushConfigured(env)) return;
+  const zambia = (offsetMs: number) => Date.now() + 2 * 3600000 + offsetMs; // CAT (UTC+2)
+  const now = Date.now() + 2 * 3600000; // current CAT time
+  const in48h = zambia(48 * 3600000);
+  const in2h = zambia(2 * 3600000);
+
+  const events = await env.DB.prepare(
+    `SELECT c.id, c.title, c.event_date, c.event_time, c.event_capacity,
+            c.event_remind_48h, c.event_remind_2h,
+            c.host_user_id, u.phone AS host_phone
+     FROM campaigns c JOIN users u ON u.id = c.host_user_id
+     WHERE c.status = 'active'
+       AND (c.campaign_type = 'event' OR (c.event_tiers IS NOT NULL AND c.event_tiers != ''))
+       AND c.event_date IS NOT NULL`
+  ).all<Record<string, any>>();
+
+  for (const ev of events.results) {
+    // Event start = event_date + event_time (default 18:00), CAT.
+    const time = (ev.event_time ?? "18:00").split(":").map(Number);
+    const start = new Date(Date.parse(`${ev.event_date}T${String(time[0] ?? 18).padStart(2, "0")}:${String(time[1] ?? 0).padStart(2, "0")}:00+02:00`));
+    if (isNaN(start.getTime())) continue;
+
+    const at48 = start.getTime() - 48 * 3600000;
+    const at2 = start.getTime() - 2 * 3600000;
+    const inWindow = (target: number) => now >= target - 60 * 60000 && now <= target + 60 * 60000;
+
+    // Decide which buckets to fire this pass.
+    const fire48 = !ev.event_remind_48h && at48 > Date.now() && inWindow(at48);
+    const fire2 = !ev.event_remind_2h && at2 > Date.now() && inWindow(at2);
+
+    if (!fire48 && !fire2) continue;
+
+    const startLabel = `${ev.event_date} ${(ev.event_time ?? "18:00")}`;
+    const flags: string[] = [];
+    if (fire48) flags.push("event_remind_48h = 1");
+    if (fire2) flags.push("event_remind_2h = 1");
+
+    // Ticket holders (confirmed contributions with a tier).
+    const buyers = await env.DB.prepare(
+      `SELECT DISTINCT dt.token, dt.user_id FROM device_tokens dt
+       JOIN contributions co ON co.donor_user_id = dt.user_id
+       WHERE co.campaign_id = ? AND co.status = 'confirmed' AND co.tier_name IS NOT NULL`
+    ).bind(ev.id).all<{ token: string; user_id: number }>();
+    const tokens = buyers.results.map((b) => b.token);
+
+    if (fire48 && tokens.length) {
+      await sendMulticastPush(fbEnv(env), tokens,
+        `⏰ "${ev.title}" starts in 2 days`,
+        `Don't forget — the event kicks off on ${startLabel}. See you there!`,
+        { type: "event_reminder", campaignId: String(ev.id), when: "48h" })
+        .catch((e) => console.error("event 48h reminder failed:", e));
+      for (const uid of [...new Set(buyers.results.map((b) => b.user_id))]) {
+        await recordNotification(env, uid, "event_reminder",
+          `"${ev.title}" starts in 2 days`,
+          `The event kicks off on ${startLabel}. See you there!`,
+          { type: "event_reminder", campaignId: String(ev.id) }).catch(() => {});
+      }
+    }
+    if (fire2 && tokens.length) {
+      await sendMulticastPush(fbEnv(env), tokens,
+        `🎟️ "${ev.title}" starts in 2 hours`,
+        `Almost showtime! The event starts at ${startLabel}. Bring your ticket.`,
+        { type: "event_reminder", campaignId: String(ev.id), when: "2h" })
+        .catch((e) => console.error("event 2h reminder failed:", e));
+      for (const uid of [...new Set(buyers.results.map((b) => b.user_id))]) {
+        await recordNotification(env, uid, "event_reminder",
+          `"${ev.title}" starts in 2 hours`,
+          `Almost showtime! The event starts at ${startLabel}.`,
+          { type: "event_reminder", campaignId: String(ev.id) }).catch(() => {});
+      }
+    }
+
+    // Remind the host too.
+    if (ev.host_phone && (fire48 || fire2)) {
+      const hostTokens = await env.DB.prepare(
+        "SELECT token FROM device_tokens WHERE user_id = ?"
+      ).bind(ev.host_user_id).all<{ token: string }>();
+      if (hostTokens.results.length) {
+        await sendMulticastPush(fbEnv(env), hostTokens.results.map((t) => t.token),
+          fire2 ? "🎟️ Your event starts in 2 hours" : "⏰ Your event is in 2 days",
+          `"${ev.title}" is on ${startLabel}. Check attendance and be ready!`,
+          { type: "event_reminder", campaignId: String(ev.id), when: fire2 ? "2h" : "48h" })
+          .catch((e) => console.error("event host reminder failed:", e));
+      }
+    }
+
+    await env.DB.prepare(
+      `UPDATE campaigns SET ${flags.join(", ")} WHERE id = ?`
+    ).bind(ev.id).run();
+  }
+}
+
 /** Daily cron: SMS a reminder to donors whose pledge day is today (Zambia time, UTC+2). */
 async function runPledgeReminders(env: Bindings): Promise<void> {
   const zambia = new Date(Date.now() + 2 * 3600000); // UTC+2
@@ -1283,11 +1388,52 @@ async function runPledgeReminders(env: Bindings): Promise<void> {
   ).bind(today, daysInMonth).all<Record<string, any>>();
 
   for (const row of rows.results) {
-    // Pledge reminders are push-only (SMS is reserved for transactions + OTP).
-    await pushToUser(env, row.user_id, "Monthly pledge due",
-      `Your pledge of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${row.campaign_title}" is due.`,
-      { type: "pledge_reminder", campaignId: String(row.campaign_id) })
-      .catch((e) => console.error("push failed:", e));
+    // True recurring giving: auto-charge the pledge with a Lipila mobile-money
+    // prompt (same flow as a donation). The phone gets a payment prompt and a
+    // donation is recorded once paid via the webhook (pending contribution).
+    // A failed payment just sends the reminder so the donor can pay in-app.
+    try {
+      const campaign = await env.DB.prepare(
+        "SELECT * FROM campaigns WHERE id = ?"
+      ).bind(row.campaign_id).first<Record<string, any>>();
+      const cfg = await adminFeeConfig(env);
+      const fees = donationFees(Number(row.amount_cents), cfg, "momo");
+      const referenceId = moneyRef("PLG", Number(row.campaign_id));
+      await createCollection(env, {
+        referenceId,
+        amountCents: Number(row.amount_cents) + fees.platformFeeCents + fees.lipilaFeeCents,
+        accountNumber: String(row.phone).replace("+", ""),
+        narration: `Kingdom Sponsor monthly pledge for ${row.campaign_title ?? "campaign"}`,
+        callbackUrl: `${env.APP_URL}/api/webhooks/lipila?secret=${encodeURIComponent(env.LIPILA_WEBHOOK_SECRET)}`,
+      }, env.DB);
+      // Record a pending contribution so the webhook can confirm it.
+      await env.DB.prepare(
+        `INSERT INTO contributions (campaign_id, donor_user_id, is_anonymous, phone, amount_cents, platform_fee_cents, lipila_fee_cents, lipila_reference, status)
+         VALUES (?, ?, 1, ?, ?, ?, ?, ?, 'pending')`
+      ).bind(
+        row.campaign_id,
+        row.user_id,
+        String(row.phone),
+        Number(row.amount_cents),
+        fees.platformFeeCents,
+        fees.lipilaFeeCents,
+        referenceId,
+      ).run();
+      await env.DB.prepare(
+        "UPDATE recurring_pledges SET last_charged_at = datetime('now', '+2 hours'), last_lipila_reference = ? WHERE id = ?"
+      ).bind(referenceId, row.id).run();
+      await pushToUser(env, row.user_id, "Monthly pledge charged",
+        `Your pledge of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${row.campaign_title}" is on its way. Check your phone to approve the payment.`,
+        { type: "pledge_reminder", campaignId: String(row.campaign_id) })
+        .catch((e) => console.error("push failed:", e));
+    } catch (e) {
+      console.error("pledge auto-charge failed:", e);
+      // Payment could not start — send the reminder so the donor can pay in-app.
+      await pushToUser(env, row.user_id, "Monthly pledge due",
+        `Your pledge of ${(row.amount_cents / 100).toLocaleString()} ZMW to "${row.campaign_title}" is due. Pay it in the app.`,
+        { type: "pledge_reminder", campaignId: String(row.campaign_id) })
+        .catch((e2) => console.error("push failed:", e2));
+    }
 
     await env.DB.prepare("UPDATE recurring_pledges SET last_reminded_at = datetime('now', '+2 hours') WHERE id = ?")
       .bind(row.id).run();
@@ -2031,6 +2177,7 @@ async function campaignPublic(env: Bindings, row: Record<string, any>, authUserI
     eventTiers: parseEventTiers(row.event_tiers),
     eventCapacity: Math.max(0, Number(row.event_capacity) || 0),
     eventDate: row.event_date ?? null,
+    eventTime: row.event_time ?? null,
     eventVenue: row.event_venue ?? null,
     ticketsSold: Math.max(0, agg.t),
     rsvpCount,
@@ -2376,6 +2523,7 @@ app.post("/api/campaigns", async (c) => {
   const eventTiers = parseEventTiers(body.eventTiers);
   const eventCapacity = Math.max(0, Math.round(Number(body.eventCapacity) || 0));
   const eventDate = body.eventDate != null ? String(body.eventDate).slice(0, 10) || null : null;
+  const eventTime = body.eventTime != null ? String(body.eventTime).trim().slice(0, 5) || null : null;
   const eventVenue = body.eventVenue != null ? String(body.eventVenue).trim().slice(0, 200) || null : null;
   const imageUrl = body.imageUrl != null ? String(body.imageUrl).trim().slice(0, 500) || null : null;
   if (imageUrl !== null && !/^https:\/\/.+/.test(imageUrl)) {
@@ -2405,8 +2553,8 @@ app.post("/api/campaigns", async (c) => {
   }
 
   const r = await c.env.DB.prepare(
-    "INSERT INTO campaigns (slug, title, description, goal_cents, min_withdraw_cents, host_user_id, ends_at, min_sponsors, category, visibility, campaign_type, waive_payout_fees, event_tiers, event_capacity, event_date, event_venue, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).bind(slug, title, description, goalCents, minWithdrawCents, user.sub, endsAt, minSponsors, category, visibility, campaignType, waivePayoutFees, eventTiers.length ? JSON.stringify(eventTiers) : null, eventCapacity, eventDate, eventVenue, imageUrl).run();
+    "INSERT INTO campaigns (slug, title, description, goal_cents, min_withdraw_cents, host_user_id, ends_at, min_sponsors, category, visibility, campaign_type, waive_payout_fees, event_tiers, event_capacity, event_date, event_time, event_venue, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(slug, title, description, goalCents, minWithdrawCents, user.sub, endsAt, minSponsors, category, visibility, campaignType, waivePayoutFees, eventTiers.length ? JSON.stringify(eventTiers) : null, eventCapacity, eventDate, eventTime, eventVenue, imageUrl).run();
 
   const campaignId = Number(r.meta?.last_row_id ?? 0);
 
@@ -2476,6 +2624,7 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   const hasEventTiers = body.eventTiers !== undefined;
   const eventCapacity = body.eventCapacity != null ? Math.max(0, Math.round(Number(body.eventCapacity))) : null;
   const eventDate = body.eventDate !== undefined ? (body.eventDate == null ? null : String(body.eventDate).slice(0, 10) || null) : undefined;
+  const eventTime = body.eventTime !== undefined ? (body.eventTime == null ? null : String(body.eventTime).trim().slice(0, 5) || null) : undefined;
   const eventVenue = body.eventVenue !== undefined ? (body.eventVenue == null ? null : String(body.eventVenue).trim().slice(0, 200) || null) : undefined;
   const isEditEvent = campaignType === "event"
     || parseEventTiers(campaign.event_tiers).length > 0
@@ -2524,6 +2673,7 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   }
   if (eventCapacity !== null) { sets.push("event_capacity = ?"); vals.push(eventCapacity); }
   if (eventDate !== undefined) { sets.push("event_date = ?"); vals.push(eventDate); }
+  if (eventTime !== undefined) { sets.push("event_time = ?"); vals.push(eventTime); }
   if (eventVenue !== undefined) { sets.push("event_venue = ?"); vals.push(eventVenue); }
   if (endsAt !== null) { sets.push("ends_at = ?"); vals.push(endsAt); }
 
@@ -2597,6 +2747,7 @@ app.put("/api/campaigns/:id", async (c) => {
     ["waivePayoutFees", (v) => (v != null ? v === true : null)],
     ["eventCapacity", (v) => (v != null ? Math.max(0, Math.round(Number(v))) : null)],
     ["eventDate", (v) => (v != null ? String(v).slice(0, 10) || null : null)],
+    ["eventTime", (v) => (v != null ? String(v).trim().slice(0, 5) || null : null)],
     ["eventVenue", (v) => (v != null ? String(v).trim().slice(0, 200) || null : null)],
   ];
   for (const [key, clean] of allowed) {
@@ -4312,6 +4463,25 @@ app.post("/api/events/:id/check-in", async (c) => {
   ).bind(phone).first<{ id: number; phone: string; username: string; name: string | null }>();
   if (!attendee) return c.json({ error: "No user found for that code" }, 404);
 
+  // Ticket verification: if a contribution id is provided, make sure this user
+  // actually bought a ticket for THIS event before checking them in.
+  const ticketId = Number(body.ticketId) || 0;
+  if (ticketId > 0) {
+    const ticket = await c.env.DB.prepare(
+      `SELECT co.id, co.donor_user_id, co.tier_name, co.status
+       FROM contributions co WHERE co.id = ? AND co.campaign_id = ?`
+    ).bind(ticketId, eventId).first<{ id: number; donor_user_id: number | null; tier_name: string | null; status: string }>();
+    if (!ticket || ticket.status !== "confirmed") {
+      return c.json({ error: "This ticket is not valid for this event" }, 403);
+    }
+    if (ticket.donor_user_id && ticket.donor_user_id !== attendee.id) {
+      return c.json({ error: "This ticket belongs to a different account" }, 403);
+    }
+    if (!ticket.tier_name) {
+      return c.json({ error: "This is a donation, not a ticket" }, 403);
+    }
+  }
+
   const res = await c.env.DB.prepare(
     "INSERT OR IGNORE INTO event_attendees (event_id, user_id) VALUES (?, ?)"
   ).bind(eventId, attendee.id).run();
@@ -4759,6 +4929,39 @@ app.get("/api/me/receipts", async (c) => {
       amountCents: r.amount_cents,
       reference: r.lipila_reference,
       date: r.confirmed_at ?? r.created_at,
+    })),
+  });
+});
+
+/** User: their purchased event tickets, each with a scannable code so hosts
+ *  can check them in by scanning the QR from the phone. */
+app.get("/api/me/tickets", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+  const rows = await c.env.DB.prepare(
+    `SELECT co.id, co.tier_name, co.ticket_qty, co.amount_cents, co.confirmed_at,
+            cam.id AS campaign_id, cam.title AS campaign_title, cam.event_date, cam.event_time, cam.event_venue,
+            cam.event_capacity, cam.campaign_type
+     FROM contributions co JOIN campaigns cam ON cam.id = co.campaign_id
+     WHERE co.donor_user_id = ? AND co.status = 'confirmed'
+       AND co.tier_name IS NOT NULL
+     ORDER BY co.confirmed_at DESC LIMIT 100`
+  ).bind(user.sub).all<Record<string, any>>();
+
+  return c.json({
+    tickets: rows.results.map((r) => ({
+      id: r.id,
+      campaignId: r.campaign_id,
+      campaignTitle: r.campaign_title,
+      tierName: r.tier_name,
+      ticketQty: r.ticket_qty ?? 1,
+      amountCents: r.amount_cents,
+      date: r.confirmed_at ?? r.created_at,
+      eventDate: r.event_date ?? null,
+      eventTime: r.event_time ?? null,
+      eventVenue: r.event_venue ?? null,
+      eventCapacity: r.event_capacity ?? 0,
     })),
   });
 });
@@ -5224,6 +5427,7 @@ app.post("/api/admin/edit-requests/:id/approve", async (c) => {
   if (proposed.waivePayoutFees !== undefined) { sets.push("waive_payout_fees = ?"); vals.push(proposed.waivePayoutFees ? 1 : 0); }
   if (proposed.eventCapacity !== undefined) { sets.push("event_capacity = ?"); vals.push(proposed.eventCapacity); }
   if (proposed.eventDate !== undefined) { sets.push("event_date = ?"); vals.push(proposed.eventDate); }
+  if (proposed.eventTime !== undefined) { sets.push("event_time = ?"); vals.push(proposed.eventTime); }
   if (proposed.eventVenue !== undefined) { sets.push("event_venue = ?"); vals.push(proposed.eventVenue); }
   if ("eventTiers" in proposed) { sets.push("event_tiers = ?"); vals.push(proposed.eventTiers ? JSON.stringify(parseEventTiers(proposed.eventTiers)) : null); }
   if ("endsAt" in proposed) { sets.push("ends_at = ?"); vals.push(proposed.endsAt); }
@@ -5471,6 +5675,26 @@ app.put("/api/admin/event-commission", async (c) => {
     cardLipilaCollectionPct: cfg.cardLipilaCollectionPct,
     momoPct: cfg.lipilaCollectionPct,
   });
+});
+
+/** Admin: milestone thresholds (percentages) for donation celebration pushes. */
+app.get("/api/admin/milestone-config", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  return c.json({ thresholds: await milestoneThresholds(c.env) });
+});
+
+app.put("/api/admin/milestone-config", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const list: number[] = Array.isArray(body.thresholds)
+    ? body.thresholds.map((n: any) => Number(n)).filter((n: number) => n > 0 && n <= 100)
+    : String(body.thresholds ?? "").split(",").map((s) => Number(s.trim())).filter((n: number) => n > 0 && n <= 100);
+  if (!list.length) return c.json({ error: "Enter at least one threshold (1–100)" }, 400);
+  const sorted = [...new Set(list)].sort((a, b) => a - b);
+  await setSetting(c.env, "milestone_thresholds", sorted.join(","));
+  return c.json({ ok: true, thresholds: sorted });
 });
 
 /** Admin: set or clear the per-event platform-fee waiver. */
@@ -6485,6 +6709,16 @@ app.get("/api/campaigns/:id/analytics", async (c) => {
   const tiers = isEvent ? parseEventTiers(campaign.event_tiers) : [];
   const capacity = Math.max(0, Number(campaign.event_capacity) || 0);
 
+  // Referral attribution: donations that arrived through a shared link that
+  // carried a referral code, vs. direct (no code). Uses the registered
+  // referrer on the donor (referralCodeProvider stamps users.referral_code).
+  const referred = (await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(co.amount_cents),0) AS s
+     FROM contributions co JOIN users u ON u.id = co.donor_user_id
+     WHERE co.campaign_id = ? AND co.status = 'confirmed'
+       AND u.referral_code IS NOT NULL AND u.referral_code != ''`
+  ).bind(id).first<{ n: number; s: number }>()) ?? { n: 0, s: 0 };
+
   return c.json({
     views,
     gifts,
@@ -6492,6 +6726,10 @@ app.get("/api/campaigns/:id/analytics", async (c) => {
     conversionRate: views > 0 ? Math.round((gifts / views) * 1000) / 10 : 0,
     shareClicks,
     last14d: last14d.results.map((r) => ({ day: r.day, cents: r.cents ?? 0 })),
+    // Referral attribution.
+    referredGifts: referred.n,
+    referredCents: referred.s,
+    referredRate: gifts > 0 ? Math.round((referred.n / gifts) * 1000) / 10 : 0,
     // Event analytics.
     isEvent,
     ticketsSold: gifts,
@@ -7477,27 +7715,51 @@ app.delete("/api/admin/sample-images", async (c) => {
 
 /** Public: active opportunities a host sees on the Sponsor Desk. */
 app.get("/api/sponsor-desk", async (c) => {
+  // Host-only feature: approved hosts (and staff) see the curated opportunities.
+  // Ordinary donors never see this feed or its push.
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const staff = await requireAnyStaff(c);
+  if (!staff) {
+    const host = await c.env.DB.prepare(
+      "SELECT host_status FROM users WHERE id = ?"
+    ).bind(user.sub).first<{ host_status: string }>();
+    if (!host || host.host_status !== "approved") {
+      return c.json({ error: "Only approved hosts can view the Sponsor Desk" }, 403);
+    }
+  }
+  // The host's active campaign categories -> eligibility match scoring.
+  const hostCats = (await c.env.DB.prepare(
+    `SELECT DISTINCT c.category FROM campaigns c
+     WHERE c.host_user_id = ? AND c.status = 'active' AND c.category IS NOT NULL`
+  ).bind(user.sub).all<{ category: string }>()).results.map((r) => r.category);
   const rows = await c.env.DB.prepare(
     `SELECT id, title, description, organization, category, amount_label, deadline, link,
-            audience, published_at
+            audience, match_categories, applied_count, published_at
      FROM sponsor_desk
      WHERE status = 'active' AND published = 1
      ORDER BY COALESCE(deadline, '9999') ASC, published_at DESC
      LIMIT 50`
   ).all<Record<string, any>>();
   return c.json({
-    opportunities: rows.results.map((o) => ({
-      id: o.id,
-      title: o.title,
-      description: o.description,
-      organization: o.organization,
-      category: o.category,
-      amountLabel: o.amount_label,
-      deadline: o.deadline ?? null,
-      link: o.link,
-      audience: o.audience,
-      publishedAt: o.published_at ?? null,
-    })),
+    opportunities: rows.results.map((o) => {
+      const matchList = String(o.match_categories ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+      const matched = matchList.length === 0 || hostCats.some((hc) => matchList.includes(hc));
+      return {
+        id: o.id,
+        title: o.title,
+        description: o.description,
+        organization: o.organization,
+        category: o.category,
+        amountLabel: o.amount_label,
+        deadline: o.deadline ?? null,
+        link: o.link,
+        audience: o.audience,
+        matched,
+        appliedCount: o.applied_count ?? 0,
+        publishedAt: o.published_at ?? null,
+      };
+    }),
   });
 });
 
@@ -7526,6 +7788,8 @@ app.get("/api/admin/sponsor-desk", async (c) => {
       publishedAt: o.published_at ?? null,
       createdAt: o.created_at,
       createdByName: o.created_by_name ?? null,
+      matchCategories: String(o.match_categories ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+      appliedCount: o.applied_count ?? 0,
     })),
   });
 });
@@ -7552,6 +7816,10 @@ app.post("/api/admin/sponsor-desk", async (c) => {
     deadline = parsed.toISOString().slice(0, 10);
   }
   const audience = ["hosts", "events", "all"].includes(body.audience) ? String(body.audience) : "hosts";
+  // Optional categories this opportunity is a good fit for (comma list).
+  const matchCats = Array.isArray(body.matchCategories)
+    ? body.matchCategories.map((c: any) => String(c).trim()).filter(Boolean).slice(0, 8).join(",")
+    : String(body.matchCategories ?? "").trim().slice(0, 300);
 
   const id = body.id ? Number(body.id) : 0;
   if (id > 0) {
@@ -7559,17 +7827,31 @@ app.post("/api/admin/sponsor-desk", async (c) => {
     if (!existing) return c.json({ error: "Opportunity not found" }, 404);
     await c.env.DB.prepare(
       `UPDATE sponsor_desk SET title = ?, description = ?, organization = ?, category = ?,
-       amount_label = ?, deadline = ?, link = ?, audience = ?, updated_at = datetime('now')
+       amount_label = ?, deadline = ?, link = ?, audience = ?, match_categories = ?, updated_at = datetime('now')
        WHERE id = ?`
-    ).bind(title, description, organization, category, amountLabel, deadline, link, audience, id).run();
+    ).bind(title, description, organization, category, amountLabel, deadline, link, audience, matchCats, id).run();
     return c.json({ ok: true, id });
   }
 
   const res = await c.env.DB.prepare(
-    `INSERT INTO sponsor_desk (title, description, organization, category, amount_label, deadline, link, audience, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(title, description, organization, category, amountLabel, deadline, link, audience, admin.sub).run();
+    `INSERT INTO sponsor_desk (title, description, organization, category, amount_label, deadline, link, audience, match_categories, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(title, description, organization, category, amountLabel, deadline, link, audience, matchCats, admin.sub).run();
   return c.json({ ok: true, id: res.meta.last_row_id }, 201);
+});
+
+/** Admin or host: mark an opportunity as applied so the team sees interest. */
+app.post("/api/sponsor-desk/:id/apply", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const id = Number(c.req.param("id"));
+  await c.env.DB.prepare(
+    "UPDATE sponsor_desk SET applied_count = applied_count + 1 WHERE id = ?"
+  ).bind(id).run();
+  await pushAdmins(c.env, "Sponsor Desk application",
+    `${user.username ?? "A host"} applied to a funding opportunity.`,
+    { type: "sponsor_desk" }).catch(() => {});
+  return c.json({ ok: true });
 });
 
 /** Admin: publish a batch of draft/active opportunities to active hosts. */
@@ -8217,6 +8499,11 @@ const appObject = Sentry.withSentry(
         ctx.waitUntil(refreshMnoHealth(env));
         ctx.waitUntil(runAutoDisburse(env));
         ctx.waitUntil(runAirtimeFulfillment(env));
+        return;
+      }
+      // Hourly cron: event countdown reminders (48h / 2h).
+      if (controller.cron === "0 * * * *") {
+        ctx.waitUntil(runEventReminders(env));
         return;
       }
       // Daily cron: all scheduled jobs.

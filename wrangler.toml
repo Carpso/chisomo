@@ -5,9 +5,10 @@ workers_dev = true
 compatibility_flags = ["nodejs_compat"]
 
 # Sweep accumulated donation platform fees to SETTLEMENT_PHONE daily at 08:00 CAT
-# (Zambia / Central Africa Time = UTC+2), plus intruder-alert scan every 15 min.
+# (Zambia / Central Africa Time = UTC+2), plus intruder-alert scan every 15 min,
+# plus hourly event-reminder checks (48h/2h countdown pushes to ticket holders).
 [triggers]
-crons = ["*/15 * * * *", "0 6 * * *"]
+crons = ["*/15 * * * *", "0 6 * * *", "0 * * * *"]
 
 # DB. For remote deploy, replace database_id with the one from:
 #   npx wrangler d1 create kingdom-sponsor-db

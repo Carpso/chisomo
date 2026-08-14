@@ -4,7 +4,7 @@
 **Version**: 0.7.0 (versionCode 75)
 **Flutter Commit**: `3586782` (+ latest unpushed)
 **Backend Commit**: `dbfc5c4` (+ latest unpushed)
-**Backend Deployed Version ID**: `1910173c-dbbc-478f-9c51-fbf3e62fd9f2`
+**Backend Deployed Version ID**: `1c7e0913` (latest) — see wrangler versions list
 
 ---
 
@@ -277,6 +277,30 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
 8. Re-run migration_v44's app_settings inserts on any fresh DB (already applied to production; the ALTER TABLE part fails on re-run so apply the settings separately)
 
 ## Recent session highlights (0.7.0 hardening pass)
+- **Sponsor Desk host-gated**: `/api/sponsor-desk` now requires an approved host
+  (or staff); donors get 401/403. New `POST /api/sponsor-desk/:id/apply` records
+  interest (+admin alert); admin create/edit accepts `matchCategories`; the feed
+  flags `matched` opportunities against the host's active campaign categories.
+  Admin stats include `sponsorDeskTotal`/`sponsorDeskPublished`/`sponsorDeskActive`.
+- **Event reminders (48h / 2h)**: hourly cron `runEventReminders` pushes ticket
+  holders + host a countdown before the event (uses new `campaigns.event_time`,
+  `event_remind_48h`, `event_remind_2h`; migration_v46). Tapping routes to the
+  event. In-app "Add to calendar" (Google Calendar link) + live countdown card
+  on the event detail screen.
+- **Scannable donor tickets**: `GET /api/me/tickets` returns bought tickets;
+  My Tickets screen (Settings → My event tickets) shows a QR `KSQR|<phone>|<contributionId>`.
+  Check-in verifies the ticket (must be a confirmed tiered contribution for that
+  event, same account). QR scanner passes the ticketId through.
+- **Host insights**: campaign analytics now include referral attribution
+  (`referredGifts`, `referredCents`, `referredRate`) shown on the host analytics screen.
+- **Configurable milestones**: `GET/PUT /api/admin/milestone-config` (settings
+  scope) edits the celebration thresholds (default 25/50/75/100, stored in
+  `app_settings.milestone_thresholds`); admin dashboard has a Milestone
+  celebrations card. Milestone math now compares percentages correctly.
+- **Recurring giving auto-charge**: `runPledgeReminders` now also starts a Lipila
+  mobile-money prompt for due pledges (records a pending contribution; webhook
+  confirms it), falling back to a reminder push if payment can't start.
+  `recurring_pledges` gains `last_charged_at`/`last_lipila_reference` (migration_v46).
 - **Push notifications overhauled** (like ChurchOnApp): per-category channels
   (`giving_updates`, `events`, `support`, `payments`, `admin`, `promotions`,
   `sponsor_desk`, `broadcast`, `referrals`, `host`, `links`) — every one
@@ -290,18 +314,18 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
   check-in, donation/ticket sale, payout, promotion requested, airtime order,
   badge purchase, host application, edit/delete requests, announcements,
   support tickets, new users — so the team sees everything users do.
+- **Push reachability admin**: `GET /api/admin/push-users` + admin screen show
+  who has a registered device token (can receive closed-app pushes) vs. who
+  hasn't opened the app yet; per-user test push (`POST /api/admin/push/test-user`).
 - **Events never mix with campaigns**: `/api/campaigns` defaults to campaigns
   only; `?type=events` returns events only; search/USSD/share-page exclude
-  events; events use their own category set (`EVENT_CATEGORIES`).
+  events; events use their own category set (`EVENT_CATEGORIES`); promoted
+  events render as "Promoted Event" everywhere.
 - **Airtime provider layer (pluggable)**: AT does NOT offer airtime for Zambia, so
   `src/airtime.ts` now abstracts suppliers — `manual` (default; admin fulfils by hand +
   `POST /api/admin/airtime-orders/:id/complete`), `mtn_momo` (MTN MoMo API airtime, the
   Zambia route), `africastalking` (other markets). New `GET /api/airtime/providers`;
   admin test is provider-aware; admin airtime screen shows a provider badge.
-- **Sponsor Desk**: admin curates grant/empowerment opportunities (`sponsor_desk`
-  table, migration_v45), publishes batches to active hosts (push + in-app
-  `sponsor_desk` type → `/sponsor-desk` screen). Hosts get a Sponsor Desk banner
-  on the Host tab + notification tap routing.
 - **Notifications show time**: `safeDateTime()` in date_utils renders UTC
   `created_at` as local "14 Aug 2026 · 14:30" on the notifications list + detail.
 - **Push banners fixed**: Settings → Test notification force-refreshes the FCM token when FCM reports 0 deliveries; backend test-push reports honest sentCount; `giving_updates` channel self-heals; FCM payload pins channelId + high priority + public visibility + sound.

@@ -64,6 +64,7 @@ export function channelForType(type: string | undefined): string {
     case "new_event":
     case "ticket_confirmed":
     case "ticket_sold":
+    case "event_reminder":
       return "events"; // event tickets, RSVPs, check-ins
     case "ticket_created":
     case "ticket_ack":
