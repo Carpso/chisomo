@@ -4,7 +4,7 @@
 **Version**: 0.7.0 (versionCode 75)
 **Flutter Commit**: `3586782` (+ latest unpushed)
 **Backend Commit**: `dbfc5c4` (+ latest unpushed)
-**Backend Deployed Version ID**: `57ae8a7a-0ca2-4c2c-b254-e19ab4e8f9de`
+**Backend Deployed Version ID**: `1910173c-dbbc-478f-9c51-fbf3e62fd9f2`
 
 ---
 
@@ -277,11 +277,33 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
 8. Re-run migration_v44's app_settings inserts on any fresh DB (already applied to production; the ALTER TABLE part fails on re-run so apply the settings separately)
 
 ## Recent session highlights (0.7.0 hardening pass)
+- **Push notifications overhauled** (like ChurchOnApp): per-category channels
+  (`giving_updates`, `events`, `support`, `payments`, `admin`, `promotions`,
+  `sponsor_desk`, `broadcast`, `referrals`, `host`, `links`) — every one
+  Importance.max with sound + vibration so alerts ALWAYS pop, never silent.
+  Backend `channelForType()` in firebase.ts picks the channel per push type.
+  App: content-keyed dedup (30s) + burst coalescing (one summary per channel),
+  action button ("Open"), app-icon + brand-orange colour, and an in-app
+  slide-down banner overlay so foreground notifications are never missed.
+- **Superadmin + team alerted for EVERYTHING**: `pushAdmins` (superadmins +
+  admin assistants) now fires on new campaign/event posted, RSVP, event
+  check-in, donation/ticket sale, payout, promotion requested, airtime order,
+  badge purchase, host application, edit/delete requests, announcements,
+  support tickets, new users — so the team sees everything users do.
+- **Events never mix with campaigns**: `/api/campaigns` defaults to campaigns
+  only; `?type=events` returns events only; search/USSD/share-page exclude
+  events; events use their own category set (`EVENT_CATEGORIES`).
 - **Airtime provider layer (pluggable)**: AT does NOT offer airtime for Zambia, so
   `src/airtime.ts` now abstracts suppliers — `manual` (default; admin fulfils by hand +
   `POST /api/admin/airtime-orders/:id/complete`), `mtn_momo` (MTN MoMo API airtime, the
   Zambia route), `africastalking` (other markets). New `GET /api/airtime/providers`;
   admin test is provider-aware; admin airtime screen shows a provider badge.
+- **Sponsor Desk**: admin curates grant/empowerment opportunities (`sponsor_desk`
+  table, migration_v45), publishes batches to active hosts (push + in-app
+  `sponsor_desk` type → `/sponsor-desk` screen). Hosts get a Sponsor Desk banner
+  on the Host tab + notification tap routing.
+- **Notifications show time**: `safeDateTime()` in date_utils renders UTC
+  `created_at` as local "14 Aug 2026 · 14:30" on the notifications list + detail.
 - **Push banners fixed**: Settings → Test notification force-refreshes the FCM token when FCM reports 0 deliveries; backend test-push reports honest sentCount; `giving_updates` channel self-heals; FCM payload pins channelId + high priority + public visibility + sound.
 - **Event finder's commission**: admin-set K10 (MoMo + card) deducted from event ticket host payouts on top of the normal cut + Lipila 1.5%; per-event waive (`waive_event_fees`); all editable from Admin → Fees & commissions. Migration v44.
 - **Remote config**: fees (platform %/min/fixed, MoMo + card), airtime, badge, promotions, referral threshold, sample images — all changeable from the dashboard without redeploying (app_settings).

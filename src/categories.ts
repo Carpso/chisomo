@@ -39,3 +39,33 @@ export const CAMPAIGN_CATEGORIES = [
 export function isValidCategory(category: unknown): category is string {
   return typeof category === "string" && (CAMPAIGN_CATEGORIES as readonly string[]).includes(category);
 }
+
+/** Curated EVENT categories — events are NOT fundraisers, so they get their own
+ *  distinct category set so the two never mix. Events are campaigns with
+ *  campaign_type='event' (and typically event_tiers). Kept in sync with the
+ *  Flutter constant list (lib/features/events/event_categories.dart). */
+export const EVENT_CATEGORIES = [
+  "Other",
+  "Concert & Worship Night",
+  "Conference & Seminar",
+  "Gala & Fundraising Dinner",
+  "Church Service & Revival",
+  "Community Gathering",
+  "Charity Run & Walk",
+  "Sports Tournament",
+  "Youth Event",
+  "Children's Event",
+  "Workshop & Training",
+  "Auction & Sale",
+  "Movie & Talent Show",
+  "Networking & Mixer",
+  "Outreach & Missions Trip",
+  "Festival & Fair",
+  "Wedding & Celebration",
+  "Memorial & Tribute",
+  "Expo & Trade Show",
+] as const;
+
+export function isValidEventCategory(category: unknown): category is string {
+  return typeof category === "string" && (EVENT_CATEGORIES as readonly string[]).includes(category);
+}

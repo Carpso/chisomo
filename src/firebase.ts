@@ -31,6 +31,82 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Maps a Kingdom Sponsor notification `type` to an Android channel id. Each
+ * channel is created (Importance.max, sound + vibration) on the app side, so
+ * every alert lands on the right channel and — crucially — POPS on the phone
+ * instead of being silent. Unknown types fall back to "giving_updates".
+ */
+export function channelForType(type: string | undefined): string {
+  switch (type) {
+    case "donation":
+    case "donation_received":
+    case "new_donor":
+    case "donation_confirmed":
+    case "new_campaign":
+    case "milestone":
+    case "campaign_ended":
+    case "campaign_ending":
+    case "campaign_updated":
+    case "campaign_deleted":
+    case "campaign_restored":
+    case "campaign_edit_approved":
+    case "campaign_edit_rejected":
+    case "campaign_edit_request":
+    case "delete_request":
+    case "delete_request_rejected":
+    case "announcement":
+    case "announcement_rejected":
+      return "giving_updates"; // donations + campaign news
+    case "check_in":
+    case "rsvp":
+    case "ticket_oversold":
+    case "new_event":
+    case "ticket_confirmed":
+    case "ticket_sold":
+      return "events"; // event tickets, RSVPs, check-ins
+    case "ticket_created":
+    case "ticket_ack":
+    case "ticket_reply":
+    case "ticket_closed":
+    case "ticket_resolved":
+      return "support"; // support ticket updates
+    case "payout_started":
+    case "payout_failed":
+    case "payout_sent":
+    case "airtime_sent":
+    case "airtime_delivered":
+    case "airtime_failed":
+    case "airtime_refunded":
+      return "payments"; // payouts, refunds, airtime money events
+    case "new_user":
+    case "host_application":
+    case "admin_alert":
+    case "announcement_review":
+      return "admin"; // staff/admin-only alerts
+    case "promotion_active":
+    case "promotion_rejected":
+    case "promotion_refunded":
+    case "promotion_expired":
+      return "promotions"; // promotion status
+    case "sponsor_desk":
+      return "sponsor_desk"; // curated funding opportunities
+    case "broadcast":
+      return "broadcast"; // admin broadcasts
+    case "referral_rewarded":
+      return "referrals"; // referral rewards
+    case "badge_activated":
+    case "host_verified":
+      return "host"; // verified-host badge
+    case "link_request":
+      return "links"; // linked-account requests
+    case "test":
+      return "giving_updates";
+    default:
+      return "giving_updates";
+  }
+}
+
 export async function sendPushNotification(
   env: { FIREBASE_CLIENT_EMAIL: string; FIREBASE_PRIVATE_KEY: string },
   fcmToken: string,
@@ -49,14 +125,16 @@ export async function sendPushNotification(
           priority: "high" as const,
           ttl: 3600000,
           notification: {
-            channelId: "giving_updates",
+            channelId: channelForType(data?.type),
             sound: "default",
             priority: "high" as const,
             visibility: "public" as const,
             color: "#E65100",
+            notificationCount: 1,
+            clickAction: "FLUTTER_NOTIFICATION_CLICK",
           },
         },
-        apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
+        apns: { payload: { aps: { contentAvailable: true, sound: "default", badge: 1 } } },
       });
       return true;
     } catch (e: any) {
@@ -93,14 +171,16 @@ export async function sendMulticastPush(
       priority: "high" as const,
       ttl: 3600000,
       notification: {
-        channelId: "giving_updates",
+        channelId: channelForType(data?.type),
         sound: "default",
         priority: "high" as const,
         visibility: "public" as const,
         color: "#E65100",
+        notificationCount: 1,
+        clickAction: "FLUTTER_NOTIFICATION_CLICK",
       },
     },
-    apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
+    apns: { payload: { aps: { contentAvailable: true, sound: "default", badge: 1 } } },
   };
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {

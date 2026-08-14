@@ -18,7 +18,7 @@ import {
 } from "./messages";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { createShortLink, resolveShortLink, shortBaseUrl, shortCodeFor } from "./shorten";
-import { CAMPAIGN_CATEGORIES, isValidCategory } from "./categories";
+import { CAMPAIGN_CATEGORIES, isValidCategory, EVENT_CATEGORIES, isValidEventCategory } from "./categories";
 
 const CAMPAIGN_TYPES = [
   "community", "ngo", "faith", "emergency", "medical", "sponsor", "event",
@@ -1879,6 +1879,7 @@ const BACKUP_TABLES = [
   "admin_settings", "failed_logins", "support_tickets", "campaign_delete_requests",
   "receipt_downloads", "announcements", "short_links", "sms_events", "fee_sweeps",
   "recurring_pledges", "promotions", "lipila_logs", "airtime_orders", "host_badges",
+  "sponsor_desk",
 ];
 
 // Child-first so FK-friendly deletes succeed; inserts then run parent-first.
@@ -2069,13 +2070,27 @@ app.get("/api/campaign-categories", async (c) => {
   return c.json({ categories: CAMPAIGN_CATEGORIES });
 });
 
+app.get("/api/event-categories", async (c) => {
+  return c.json({ categories: EVENT_CATEGORIES });
+});
+
 app.get("/api/campaigns", async (c) => {
   const category = c.req.query("category");
+  // Never mix events with fundraisers: `type=events` returns ONLY events,
+  // anything else returns ONLY campaigns. The events tab asks for events,
+  // the campaigns tab gets campaigns — no cross-pollination.
+  const type = String(c.req.query("type") ?? "").trim().toLowerCase();
+  const wantEvents = type === "events" || type === "event";
+  const categoryOk = wantEvents
+    ? category && isValidEventCategory(category)
+    : category && isValidCategory(category);
+  const whereClause = wantEvents
+    ? "WHERE c.status = 'active' AND c.visibility = 'public' AND (c.campaign_type = 'event' OR (c.event_tiers IS NOT NULL AND c.event_tiers != ''))"
+    : "WHERE c.status = 'active' AND c.visibility = 'public' AND (c.campaign_type != 'event' OR c.campaign_type IS NULL) AND (c.event_tiers IS NULL OR c.event_tiers = '')";
+  const categoryClause = categoryOk ? ` AND c.category = ?` : "";
   const rows = await c.env.DB.prepare(
-    category && isValidCategory(category)
-      ? "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.status = 'active' AND c.visibility = 'public' AND c.category = ? ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100"
-      : "SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id WHERE c.status = 'active' AND c.visibility = 'public' ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100"
-  ).bind(...(category && isValidCategory(category) ? [category] : [])).all<Record<string, any>>();
+    `SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id ${whereClause}${categoryClause} ORDER BY c.promoted DESC, c.created_at DESC LIMIT 100`
+  ).bind(...(categoryOk ? [category] : [])).all<Record<string, any>>();
   const out = await Promise.all(rows.results.map(async (row) => {
     try {
       return await campaignPublic(c.env, row);
@@ -2134,6 +2149,8 @@ app.get("/api/campaigns/search", async (c) => {
     `SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org
      FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id
      WHERE c.status = 'active' AND c.visibility = 'public'
+       AND (c.campaign_type != 'event' OR c.campaign_type IS NULL)
+       AND (c.event_tiers IS NULL OR c.event_tiers = '')
        AND (c.title LIKE ? OR c.description LIKE ? OR c.category LIKE ?
             OR u.username LIKE ? OR COALESCE(u.host_org,'') LIKE ?)
      ORDER BY c.promoted DESC, c.created_at DESC LIMIT 50`
@@ -2365,7 +2382,12 @@ app.post("/api/campaigns", async (c) => {
     return c.json({ error: "imageUrl must be an https URL" }, 400);
   }
   if (!title || !description) return c.json({ error: "Title and description are required" }, 400);
-  if (!isValidCategory(category)) return c.json({ error: "Invalid campaign category" }, 400);
+  const isEventCreate = campaignType === "event" || eventTiers.length > 0;
+  if (isEventCreate) {
+    if (!isValidEventCategory(category)) return c.json({ error: "Invalid event category" }, 400);
+  } else {
+    if (!isValidCategory(category)) return c.json({ error: "Invalid campaign category" }, 400);
+  }
   if (!(CAMPAIGN_TYPES as readonly string[]).includes(campaignType)) return c.json({ error: "Invalid campaign type" }, 400);
 
   let endsAt: string | null = null;
@@ -2387,6 +2409,12 @@ app.post("/api/campaigns", async (c) => {
   ).bind(slug, title, description, goalCents, minWithdrawCents, user.sub, endsAt, minSponsors, category, visibility, campaignType, waivePayoutFees, eventTiers.length ? JSON.stringify(eventTiers) : null, eventCapacity, eventDate, eventVenue, imageUrl).run();
 
   const campaignId = Number(r.meta?.last_row_id ?? 0);
+
+  // Alert the admin team about every new campaign or event posted.
+  await pushAdmins(c.env,
+    campaignType === "event" ? "New event posted" : "New campaign posted",
+    `${user.username ?? "A host"} ${campaignType === "event" ? "listed the event" : "started the campaign"} "${title}".`,
+    { type: campaignType === "event" ? "new_event" : "new_campaign", campaignId: String(campaignId) }).catch(() => {});
 
   // Notify past donors of this host's campaigns about the new campaign
   // (only public ones — a private campaign is shared by the host directly).
@@ -2449,8 +2477,11 @@ app.put("/api/admin/campaigns/:id", async (c) => {
   const eventCapacity = body.eventCapacity != null ? Math.max(0, Math.round(Number(body.eventCapacity))) : null;
   const eventDate = body.eventDate !== undefined ? (body.eventDate == null ? null : String(body.eventDate).slice(0, 10) || null) : undefined;
   const eventVenue = body.eventVenue !== undefined ? (body.eventVenue == null ? null : String(body.eventVenue).trim().slice(0, 200) || null) : undefined;
-  if (category !== null && !isValidCategory(category)) {
-    return c.json({ error: "Invalid campaign category" }, 400);
+  const isEditEvent = campaignType === "event"
+    || parseEventTiers(campaign.event_tiers).length > 0
+    || parseEventTiers(eventTiersRaw ?? campaign.event_tiers).length > 0;
+  if (category !== null && !(isEditEvent ? isValidEventCategory(category) : isValidCategory(category))) {
+    return c.json({ error: isEditEvent ? "Invalid event category" : "Invalid campaign category" }, 400);
   }
   if (visibility !== null && !["public", "private"].includes(visibility)) {
     return c.json({ error: "Invalid visibility" }, 400);
@@ -2587,8 +2618,12 @@ app.put("/api/campaigns/:id", async (c) => {
   if (Object.keys(proposed).length === 0) {
     return c.json({ error: "No changes to request" }, 400);
   }
-  if (proposed.category != null && !isValidCategory(proposed.category)) {
-    return c.json({ error: "Invalid campaign category" }, 400);
+  const proposedCampaignType = proposed.campaignType ?? campaign.campaign_type ?? "community";
+  const isEditEvent = proposedCampaignType === "event"
+    || parseEventTiers(campaign.event_tiers).length > 0
+    || (proposed.eventTiers != null && parseEventTiers(proposed.eventTiers).length > 0);
+  if (proposed.category != null && !(isEditEvent ? isValidEventCategory(proposed.category) : isValidCategory(proposed.category))) {
+    return c.json({ error: isEditEvent ? "Invalid event category" : "Invalid campaign category" }, 400);
   }
   if (proposed.visibility != null && !["public", "private"].includes(proposed.visibility)) {
     return c.json({ error: "Invalid visibility" }, 400);
@@ -3636,6 +3671,10 @@ app.post("/api/campaigns/:id/promote", async (c) => {
     }, c.env.DB);
     await c.env.DB.prepare("UPDATE promotions SET lipila_reference = ? WHERE id = ?")
       .bind(referenceId, r.meta.last_row_id).run();
+    // Alert the admin team that a host is promoting their campaign.
+    await pushAdmins(c.env, "Campaign promotion requested",
+      `${user.username ?? "A host"} is promoting "${campaign.title}" for ${days} days (${formatKwacha(price)}).`,
+      { type: "promotion_active", campaignId: String(campaign.id) }).catch(() => {});
     return c.json({
       referenceId,
       message: `Confirm the K${(price / 100).toLocaleString()} payment on your phone to go to the top for ${days} days.`,
@@ -4253,6 +4292,11 @@ app.post("/api/events/:id/check-in", async (c) => {
   await recordNotification(c.env, attendee.id, "check_in", "Checked in!",
     `You're checked in to "${campaign.title}". Enjoy the event!`, { type: "check_in", campaignId: String(eventId) });
 
+  // Alert the admin team about a check-in at an event.
+  await pushAdmins(c.env, "Event check-in",
+    `${attendee.username ?? attendee.name ?? "Someone"} checked in to "${campaign.title}".`,
+    { type: "check_in", campaignId: String(eventId) }).catch(() => {});
+
   return c.json({
     ok: true,
     first,
@@ -4300,7 +4344,7 @@ app.get("/api/events/:id/attendees", async (c) => {
 app.post("/api/events/:id/rsvp", async (c) => {
   const user = await authUser(c);
   const eventId = Number(c.req.param("id"));
-  const campaign = await c.env.DB.prepare("SELECT event_tiers, status FROM campaigns WHERE id = ?").bind(eventId).first<{ event_tiers: string | null; status: string }>();
+  const campaign = await c.env.DB.prepare("SELECT event_tiers, status, title FROM campaigns WHERE id = ?").bind(eventId).first<{ event_tiers: string | null; status: string; title: string }>();
   if (!campaign) return c.json({ error: "Event not found" }, 404);
   if (campaign.status !== "active") return c.json({ error: "Event is closed" }, 400);
   if (parseEventTiers(campaign.event_tiers).length > 0) {
@@ -4320,6 +4364,10 @@ app.post("/api/events/:id/rsvp", async (c) => {
       `Your RSVP for the event is confirmed. See you there!`, { type: "rsvp", campaignId: String(eventId) });
     await pushToUser(c.env, user.sub, "You're going!", "Your RSVP for the event is confirmed. See you there!", { type: "rsvp", campaignId: String(eventId) });
   }
+  // Alert the admin team about every RSVP.
+  await pushAdmins(c.env, "New event RSVP",
+    `${name || user?.username || "Someone"} RSVP'd to "${campaign?.title ?? `event ${eventId}`}".`,
+    { type: "rsvp", campaignId: String(eventId) }).catch(() => {});
   const total = (await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM event_rsvps WHERE event_id = ?"
   ).bind(eventId).first<{ n: number }>())?.n ?? 0;
@@ -6420,6 +6468,8 @@ app.get("/api/search", async (c) => {
     `SELECT c.*, u.username AS host_name, u.host_verified, u.host_org AS host_org
      FROM campaigns c LEFT JOIN users u ON u.id = c.host_user_id
      WHERE c.status = 'active' AND c.visibility = 'public'
+       AND (c.campaign_type != 'event' OR c.campaign_type IS NULL)
+       AND (c.event_tiers IS NULL OR c.event_tiers = '')
        AND (c.title LIKE ? OR c.description LIKE ? OR c.category LIKE ?)
      ORDER BY c.promoted DESC, c.created_at DESC LIMIT 20`
   ).bind(like, like, like).all<Record<string, any>>();
@@ -7372,6 +7422,177 @@ app.delete("/api/admin/sample-images", async (c) => {
   return c.json({ ok: true });
 });
 
+// ---------- Sponsor Desk (curated grant / funding intelligence) ----------
+// Admin curates 3-5 active grant & empowerment opportunities and publishes the
+// batch to active campaign hosts. Hosts get the app's "Sponsor Desk" screen and
+// a push/in-app notification so they keep coming back for funding intelligence,
+// not just payment processing.
+
+/** Public: active opportunities a host sees on the Sponsor Desk. */
+app.get("/api/sponsor-desk", async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT id, title, description, organization, category, amount_label, deadline, link,
+            audience, published_at
+     FROM sponsor_desk
+     WHERE status = 'active' AND published = 1
+     ORDER BY COALESCE(deadline, '9999') ASC, published_at DESC
+     LIMIT 50`
+  ).all<Record<string, any>>();
+  return c.json({
+    opportunities: rows.results.map((o) => ({
+      id: o.id,
+      title: o.title,
+      description: o.description,
+      organization: o.organization,
+      category: o.category,
+      amountLabel: o.amount_label,
+      deadline: o.deadline ?? null,
+      link: o.link,
+      audience: o.audience,
+      publishedAt: o.published_at ?? null,
+    })),
+  });
+});
+
+/** Admin: full list (drafts + published + archived) for management. */
+app.get("/api/admin/sponsor-desk", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const rows = await c.env.DB.prepare(
+    `SELECT sd.*, u.username AS created_by_name
+     FROM sponsor_desk sd LEFT JOIN users u ON u.id = sd.created_by
+     ORDER BY sd.created_at DESC LIMIT 200`
+  ).all<Record<string, any>>();
+  return c.json({
+    opportunities: rows.results.map((o) => ({
+      id: o.id,
+      title: o.title,
+      description: o.description,
+      organization: o.organization,
+      category: o.category,
+      amountLabel: o.amount_label,
+      deadline: o.deadline ?? null,
+      link: o.link,
+      audience: o.audience,
+      status: o.status,
+      published: !!o.published,
+      publishedAt: o.published_at ?? null,
+      createdAt: o.created_at,
+      createdByName: o.created_by_name ?? null,
+    })),
+  });
+});
+
+/** Admin: create or update an opportunity (draft by default). */
+app.post("/api/admin/sponsor-desk", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const title = String(body.title ?? "").trim().slice(0, 200);
+  if (!title) return c.json({ error: "Title is required" }, 400);
+  const description = String(body.description ?? "").trim().slice(0, 4000);
+  const organization = String(body.organization ?? "").trim().slice(0, 200);
+  const category = String(body.category ?? "Grant").trim().slice(0, 60);
+  const amountLabel = String(body.amountLabel ?? "").trim().slice(0, 120);
+  const link = String(body.link ?? "").trim().slice(0, 1000);
+  if (link && !/^https?:\/\//.test(link)) {
+    return c.json({ error: "link must be a full http(s) URL" }, 400);
+  }
+  let deadline: string | null = null;
+  if (body.deadline) {
+    const parsed = new Date(String(body.deadline));
+    if (isNaN(parsed.getTime())) return c.json({ error: "deadline must be a valid date" }, 400);
+    deadline = parsed.toISOString().slice(0, 10);
+  }
+  const audience = ["hosts", "events", "all"].includes(body.audience) ? String(body.audience) : "hosts";
+
+  const id = body.id ? Number(body.id) : 0;
+  if (id > 0) {
+    const existing = await c.env.DB.prepare("SELECT id FROM sponsor_desk WHERE id = ?").bind(id).first();
+    if (!existing) return c.json({ error: "Opportunity not found" }, 404);
+    await c.env.DB.prepare(
+      `UPDATE sponsor_desk SET title = ?, description = ?, organization = ?, category = ?,
+       amount_label = ?, deadline = ?, link = ?, audience = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    ).bind(title, description, organization, category, amountLabel, deadline, link, audience, id).run();
+    return c.json({ ok: true, id });
+  }
+
+  const res = await c.env.DB.prepare(
+    `INSERT INTO sponsor_desk (title, description, organization, category, amount_label, deadline, link, audience, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(title, description, organization, category, amountLabel, deadline, link, audience, admin.sub).run();
+  return c.json({ ok: true, id: res.meta.last_row_id }, 201);
+});
+
+/** Admin: publish a batch of draft/active opportunities to active hosts. */
+app.post("/api/admin/sponsor-desk/publish", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Boolean) : [];
+  if (!ids.length) return c.json({ error: "Pick at least one opportunity to publish" }, 400);
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = await c.env.DB.prepare(
+    `SELECT id, title, organization, deadline FROM sponsor_desk WHERE id IN (${placeholders})`
+  ).bind(...ids).all<Record<string, any>>();
+  const picked = rows.results;
+  if (!picked.length) return c.json({ error: "No matching opportunities found" }, 404);
+  await c.env.DB.prepare(
+    `UPDATE sponsor_desk SET published = 1, published_at = COALESCE(published_at, datetime('now')) WHERE id IN (${placeholders})`
+  ).bind(...ids).run();
+
+  // Push + in-app notification to ACTIVE hosts (approved hosts with an active
+  // campaign). These are the hosts most likely to apply for a grant today.
+  const hostRows = await c.env.DB.prepare(
+    `SELECT DISTINCT u.id, u.phone FROM users u
+     WHERE u.host_status = 'approved'
+       AND u.notifications_enabled = 1
+       AND EXISTS (SELECT 1 FROM campaigns c WHERE c.host_user_id = u.id AND c.status = 'active')`
+  ).all<{ id: number; phone: string }>();
+  const title = `New funding opportunities (${picked.length})`;
+  const firstLine = picked.slice(0, 3).map((p) => `• ${p.title}`).join("\n");
+  const bodyText = `Your weekly Sponsor Desk is in: ${picked.length} new grant/empowerment opportunities.\n${firstLine}\n\nOpen the app to apply.`;
+  let sentCount = 0;
+  for (const host of hostRows.results) {
+    const tokens = await c.env.DB.prepare("SELECT token FROM device_tokens WHERE user_id = ?")
+      .bind(host.id).all<{ token: string }>();
+    if (!tokens.results.length) continue;
+    const result = await sendMulticastPush(fbEnv(c.env), tokens.results.map((t) => t.token),
+      title, `New funding opportunities are on your Sponsor Desk — tap to view.`,
+      { type: "sponsor_desk", opportunityCount: String(picked.length) })
+      .catch((e) => { console.error("sponsor desk push failed:", e); return { success: 0, failure: 0, failedTokens: [] as string[] }; });
+    sentCount += result.success;
+    if (result.failedTokens.length) await pruneInvalidTokens(c.env, result.failedTokens);
+    await recordNotification(c.env, host.id, "sponsor_desk", title,
+      `${picked.length} new grant/empowerment opportunities are on your Sponsor Desk.`, { type: "sponsor_desk" });
+  }
+  return c.json({ ok: true, published: picked.length, hostsNotified: hostRows.results.length, sentCount });
+});
+
+/** Admin: toggle an opportunity's status (active <-> archived). */
+app.post("/api/admin/sponsor-desk/:id/status", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json().catch(() => ({}));
+  const status = body.status === "archived" ? "archived" : "active";
+  const res = await c.env.DB.prepare(
+    "UPDATE sponsor_desk SET status = ?, updated_at = datetime('now') WHERE id = ?"
+  ).bind(status, id).run();
+  if ((res.meta?.changes ?? 0) === 0) return c.json({ error: "Opportunity not found" }, 404);
+  return c.json({ ok: true, status });
+});
+
+/** Admin: permanently delete an opportunity. */
+app.delete("/api/admin/sponsor-desk/:id", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const id = Number(c.req.param("id"));
+  await c.env.DB.prepare("DELETE FROM sponsor_desk WHERE id = ?").bind(id).run();
+  return c.json({ ok: true });
+});
+
 // ---------- public share page (WhatsApp links + QR-friendly) ----------
 // Orange app theme, and a full payment flow (mobile money PIN prompt or card)
 // so ANYONE — including iPhone users without the app — can give or buy event
@@ -7582,7 +7803,7 @@ app.get("/share/:id/embed", async (c) => {
 app.get("/share", async (c) => {
   const ref = String(c.req.query("ref") ?? "").trim().toUpperCase().slice(0, 12);
   const top = await c.env.DB.prepare(
-    "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY created_at DESC LIMIT 5"
+    "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' AND (campaign_type != 'event' OR campaign_type IS NULL) AND (event_tiers IS NULL OR event_tiers = '') ORDER BY created_at DESC LIMIT 5"
   ).all<{ id: number; title: string }>();
   const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : "";
   const rows = top.results.map((t) => `<a class="btn2" href="${c.env.APP_URL}/share/${t.id}${refQuery}">${escHtml(t.title)}</a>`).join("");
@@ -7603,7 +7824,7 @@ app.post("/api/ussd", async (c) => {
 
   async function topCampaigns() {
     return (await c.env.DB.prepare(
-      "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY created_at DESC LIMIT 10"
+      "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' AND (campaign_type != 'event' OR campaign_type IS NULL) AND (event_tiers IS NULL OR event_tiers = '') ORDER BY created_at DESC LIMIT 10"
     ).all<{ id: number; title: string }>()).results;
   }
 
@@ -7948,7 +8169,7 @@ app.post("/api/ussd/callback", async (c) => {
       case "1":
         response = "CON Choose campaign:\n";
         const rows = await c.env.DB.prepare(
-          "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' ORDER BY promoted DESC, created_at DESC LIMIT 5"
+          "SELECT id, title FROM campaigns WHERE status = 'active' AND visibility = 'public' AND (campaign_type != 'event' OR campaign_type IS NULL) AND (event_tiers IS NULL OR event_tiers = '') ORDER BY promoted DESC, created_at DESC LIMIT 5"
         ).all<{ id: number; title: string }>();
         for (let i = 0; i < rows.results.length; i++) {
           response += `${i + 1}. ${rows.results[i].title}\n`;
@@ -8120,6 +8341,11 @@ app.post("/api/host/badge/subscribe", async (c) => {
     { type: "badge_activated", tier })
     .catch((e) => console.error("badge push failed:", e));
 
+  // Alert the admin team about a badge purchase (revenue signal).
+  await pushAdmins(c.env, "Verified Host badge purchased",
+    `${user.username ?? "A host"} subscribed to the ${tier} badge (${formatKwacha(priceCents)}).`,
+    { type: "badge_activated" }).catch(() => {});
+
   return c.json({ ok: true, message: "Badge activated!", tier, expiresInDays: days });
 });
 
@@ -8230,6 +8456,11 @@ app.post("/api/airtime/order", async (c) => {
     console.error("airtime collection failed:", e);
     return c.json({ error: "Airtime payment could not be started. Try again." }, 502);
   }
+
+  // Alert the admin team about every airtime order placed.
+  await pushAdmins(c.env, "New airtime order",
+    `${user.username ?? "A user"} ordered ${formatKwacha(amountCents)} of ${network} airtime for ${phone}.`,
+    { type: "airtime_sent" }).catch(() => {});
 
   return c.json({
     ok: true,
