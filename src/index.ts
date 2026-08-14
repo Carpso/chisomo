@@ -3716,6 +3716,10 @@ app.get("/api/campaigns/:id/chat", async (c) => {
      FROM campaign_chat WHERE campaign_id = ?
      ORDER BY id ASC LIMIT 200`
   ).bind(campaignId).all<Record<string, any>>();
+  const isCurrentHost = Number(campaign.host_user_id) === Number(user.sub);
+  const currentIsStaff = isAdminPhone(c.env, user.phone)
+    || await c.env.DB.prepare("SELECT 1 FROM admin_assistants WHERE user_id = ? LIMIT 1")
+      .bind(user.sub).first();
   return c.json({
     messages: rows.results.map((m) => ({
       id: m.id,
@@ -3726,6 +3730,7 @@ app.get("/api/campaigns/:id/chat", async (c) => {
       createdAt: m.created_at,
       isMine: Number(m.user_id) === Number(user.sub),
       isHost: Number(m.user_id) === Number(campaign.host_user_id),
+      canDelete: Number(m.user_id) === Number(user.sub) || isCurrentHost || !!currentIsStaff,
     })),
   });
 });
@@ -3805,6 +3810,35 @@ app.post("/api/campaigns/:id/chat", async (c) => {
   }
 
   return c.json({ ok: true, id: messageId });
+});
+
+/** Delete a chat message. The author may delete their own message; the campaign
+ *  host (or any staff) may delete any message in their campaign's chat. */
+app.delete("/api/campaigns/:id/chat/:messageId", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const campaignId = Number(c.req.param("id"));
+  const messageId = Number(c.req.param("messageId"));
+  const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
+    .bind(campaignId).first<Record<string, any>>();
+  if (!campaign || campaign.status === "draft") return c.json({ error: "Campaign not found" }, 404);
+
+  const message = await c.env.DB.prepare(
+    "SELECT * FROM campaign_chat WHERE id = ? AND campaign_id = ?"
+  ).bind(messageId, campaignId).first<Record<string, any>>();
+  if (!message) return c.json({ error: "Message not found" }, 404);
+
+  const isAuthor = Number(message.user_id) === Number(user.sub);
+  const isHost = Number(campaign.host_user_id) === Number(user.sub);
+  const isAdmin = isAdminPhone(c.env, user.phone);
+  const isStaff = await c.env.DB.prepare("SELECT 1 FROM admin_assistants WHERE user_id = ? LIMIT 1")
+    .bind(user.sub).first();
+  if (!isAuthor && !isHost && !isAdmin && !isStaff) {
+    return c.json({ error: "You can only delete your own messages" }, 403);
+  }
+
+  await c.env.DB.prepare("DELETE FROM campaign_chat WHERE id = ?").bind(messageId).run();
+  return c.json({ ok: true });
 });
 
 // ---------- Couple/Family Account Linking ----------
