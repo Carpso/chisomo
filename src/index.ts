@@ -3675,7 +3675,11 @@ app.post("/api/admin/announcements/:id/reject", async (c) => {
 
 /** Who may read/post in a campaign's chat: the host, staff, and anyone with a
  *  confirmed contribution OR an RSVP for this campaign. */
-async function chatCanParticipate(env: Bindings, campaign: Record<string, any>, user: TokenPayload): Promise<boolean> {
+/** Who may POST in a campaign's chat: the host, staff, and anyone with a
+ *  confirmed contribution OR an RSVP for this campaign. Reading is open to
+ *  everyone who can see the campaign (public campaigns), so visitors can see
+ *  the conversation and are motivated to join. */
+async function chatCanPost(env: Bindings, campaign: Record<string, any>, user: TokenPayload): Promise<boolean> {
   if (Number(campaign.host_user_id) === Number(user.sub)) return true;
   if (isAdminPhone(env, user.phone)) return true;
   const staff = await env.DB.prepare("SELECT 1 FROM admin_assistants WHERE user_id = ? LIMIT 1")
@@ -3691,7 +3695,9 @@ async function chatCanParticipate(env: Bindings, campaign: Record<string, any>, 
   return !!rsvp;
 }
 
-/** Campaign chat: recent messages (oldest-first for a normal conversation view). */
+/** Campaign chat: recent messages (oldest-first for a normal conversation view).
+ *  Reading is open to any signed-in user who can view the campaign, so the
+ *  conversation is visible (and motivating) even before someone donates. */
 app.get("/api/campaigns/:id/chat", async (c) => {
   const user = await authUser(c);
   if (!user) return c.json({ error: "Not authenticated" }, 401);
@@ -3699,8 +3705,11 @@ app.get("/api/campaigns/:id/chat", async (c) => {
   const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
     .bind(campaignId).first<Record<string, any>>();
   if (!campaign || campaign.status === "draft") return c.json({ error: "Campaign not found" }, 404);
-  if (!(await chatCanParticipate(c.env, campaign, user))) {
-    return c.json({ error: "Support this campaign to join the conversation" }, 403);
+  if (campaign.visibility === "private") {
+    // Private campaigns: only the host, staff, and confirmed supporters.
+    if (!(await chatCanPost(c.env, campaign, user))) {
+      return c.json({ error: "This conversation is private" }, 403);
+    }
   }
   const rows = await c.env.DB.prepare(
     `SELECT id, user_id, name, avatar_url, body, created_at
@@ -3721,7 +3730,7 @@ app.get("/api/campaigns/:id/chat", async (c) => {
   });
 });
 
-/** Post a message to a campaign/event chat. */
+/** Post a message to a campaign/event chat (host + confirmed supporters). */
 app.post("/api/campaigns/:id/chat", async (c) => {
   const user = await authUser(c);
   if (!user) return c.json({ error: "Not authenticated" }, 401);
@@ -3729,7 +3738,7 @@ app.post("/api/campaigns/:id/chat", async (c) => {
   const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
     .bind(campaignId).first<Record<string, any>>();
   if (!campaign || campaign.status === "draft") return c.json({ error: "Campaign not found" }, 404);
-  if (!(await chatCanParticipate(c.env, campaign, user))) {
+  if (!(await chatCanPost(c.env, campaign, user))) {
     return c.json({ error: "Support this campaign to join the conversation" }, 403);
   }
   const body = await c.req.json();
