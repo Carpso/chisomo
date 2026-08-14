@@ -2073,7 +2073,7 @@ const BACKUP_TABLES = [
   "admin_settings", "failed_logins", "support_tickets", "campaign_delete_requests",
   "receipt_downloads", "announcements", "short_links", "sms_events", "fee_sweeps",
   "recurring_pledges", "promotions", "lipila_logs", "airtime_orders", "host_badges",
-  "sponsor_desk",
+  "sponsor_desk", "campaign_chat",
 ];
 
 // Child-first so FK-friendly deletes succeed; inserts then run parent-first.
@@ -3665,6 +3665,137 @@ app.post("/api/admin/announcements/:id/reject", async (c) => {
     { type: "announcement_rejected", campaignId: String(row.campaign_id) }).catch(() => {});
 
   return c.json({ ok: true, message: "Update rejected and the host was notified." });
+});
+
+// ---------- Campaign / event chat ----------
+// A private, campaign-scoped conversation between the host and confirmed
+// supporters (donors, ticket holders, RSVPs). Anyone who has contributed to the
+// campaign can read + post; the host and staff can too. New messages push to
+// everyone else who supports the campaign (via the `chat` channel).
+
+/** Who may read/post in a campaign's chat: the host, staff, and anyone with a
+ *  confirmed contribution OR an RSVP for this campaign. */
+async function chatCanParticipate(env: Bindings, campaign: Record<string, any>, user: TokenPayload): Promise<boolean> {
+  if (Number(campaign.host_user_id) === Number(user.sub)) return true;
+  if (isAdminPhone(env, user.phone)) return true;
+  const staff = await env.DB.prepare("SELECT 1 FROM admin_assistants WHERE user_id = ? LIMIT 1")
+    .bind(user.sub).first();
+  if (staff) return true;
+  const contributed = await env.DB.prepare(
+    `SELECT 1 FROM contributions WHERE campaign_id = ? AND donor_user_id = ? AND status = 'confirmed' LIMIT 1`
+  ).bind(campaign.id, user.sub).first();
+  if (contributed) return true;
+  const rsvp = await env.DB.prepare(
+    `SELECT 1 FROM event_rsvps WHERE event_id = ? AND user_id = ? LIMIT 1`
+  ).bind(campaign.id, user.sub).first();
+  return !!rsvp;
+}
+
+/** Campaign chat: recent messages (oldest-first for a normal conversation view). */
+app.get("/api/campaigns/:id/chat", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const campaignId = Number(c.req.param("id"));
+  const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
+    .bind(campaignId).first<Record<string, any>>();
+  if (!campaign || campaign.status === "draft") return c.json({ error: "Campaign not found" }, 404);
+  if (!(await chatCanParticipate(c.env, campaign, user))) {
+    return c.json({ error: "Support this campaign to join the conversation" }, 403);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT id, user_id, name, avatar_url, body, created_at
+     FROM campaign_chat WHERE campaign_id = ?
+     ORDER BY id ASC LIMIT 200`
+  ).bind(campaignId).all<Record<string, any>>();
+  return c.json({
+    messages: rows.results.map((m) => ({
+      id: m.id,
+      userId: m.user_id,
+      name: m.name,
+      avatarUrl: m.avatar_url,
+      body: m.body,
+      createdAt: m.created_at,
+      isMine: Number(m.user_id) === Number(user.sub),
+      isHost: Number(m.user_id) === Number(campaign.host_user_id),
+    })),
+  });
+});
+
+/** Post a message to a campaign/event chat. */
+app.post("/api/campaigns/:id/chat", async (c) => {
+  const user = await authUser(c);
+  if (!user) return c.json({ error: "Not authenticated" }, 401);
+  const campaignId = Number(c.req.param("id"));
+  const campaign = await c.env.DB.prepare("SELECT * FROM campaigns WHERE id = ?")
+    .bind(campaignId).first<Record<string, any>>();
+  if (!campaign || campaign.status === "draft") return c.json({ error: "Campaign not found" }, 404);
+  if (!(await chatCanParticipate(c.env, campaign, user))) {
+    return c.json({ error: "Support this campaign to join the conversation" }, 403);
+  }
+  const body = await c.req.json();
+  const text = String(body.body ?? "").trim().slice(0, 1000);
+  if (!text) return c.json({ error: "Message cannot be empty" }, 400);
+
+  // Rate-limit: max 5 messages per 30s per user (prevents spam floods).
+  const recent = (await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM campaign_chat WHERE user_id = ? AND created_at > datetime('now', '-30 seconds')"
+  ).bind(user.sub).first<{ n: number }>())?.n ?? 0;
+  if (recent >= 5) return c.json({ error: "You're sending messages too fast. Slow down a moment." }, 429);
+
+  const r = await c.env.DB.prepare(
+    `INSERT INTO campaign_chat (campaign_id, user_id, name, avatar_url, body)
+     VALUES (?, ?, ?, ?, ?)`
+  ).bind(
+    campaignId,
+    user.sub,
+    user.username ?? "Supporter",
+    null,
+    text,
+  ).run();
+  const messageId = Number(r.meta.last_row_id);
+
+  // Look up the poster's live profile (name + avatar) so chat bubbles show the
+  // user's real picture, not a stale token value.
+  const profile = await c.env.DB.prepare(
+    "SELECT username, name, avatar_url FROM users WHERE id = ?"
+  ).bind(user.sub).first<{ username: string | null; name: string | null; avatar_url: string | null }>();
+  const poster = {
+    name: profile?.name || profile?.username || user.username || "Supporter",
+    avatarUrl: profile?.avatar_url ?? null,
+  };
+  await c.env.DB.prepare(
+    "UPDATE campaign_chat SET name = ?, avatar_url = ? WHERE id = ?"
+  ).bind(poster.name, poster.avatarUrl, messageId).run();
+
+  // Push the new message to the campaign's other confirmed supporters
+  // (multi-device), so they're alerted in real time even with the app closed.
+  if (envPushConfigured(c.env)) {
+    const others = await c.env.DB.prepare(
+      `SELECT DISTINCT dt.token, dt.user_id FROM device_tokens dt
+       JOIN contributions co ON co.donor_user_id = dt.user_id
+       WHERE co.campaign_id = ? AND co.status = 'confirmed' AND co.donor_user_id != ?
+       UNION
+       SELECT DISTINCT dt.token, dt.user_id FROM device_tokens dt
+       WHERE dt.user_id = ? AND dt.user_id != ?
+       LIMIT 2000`
+    ).bind(campaignId, user.sub, campaign.host_user_id, user.sub).all<{ token: string; user_id: number }>();
+    const sender = poster.name;
+    const isEvent = campaign.campaign_type === "event"
+      || (campaign.event_tiers != null && campaign.event_tiers !== "");
+    const pushTitle = `${sender} in ${isEvent ? "event chat" : "campaign chat"}`;
+    const pushBody = text.slice(0, 120);
+    const result = await sendMulticastPush(fbEnv(c.env), others.results.map((o) => o.token),
+      pushTitle, pushBody,
+      { type: "chat", campaignId: String(campaignId), messageId: String(messageId) })
+      .catch((e) => { console.error("chat push failed:", e); return { success: 0, failure: 0, failedTokens: [] as string[] }; });
+    if (result.failedTokens.length) await pruneInvalidTokens(c.env, result.failedTokens);
+    for (const uid of [...new Set(others.results.map((o) => o.user_id))]) {
+      await recordNotification(c.env, uid, "chat", pushTitle, pushBody,
+        { type: "chat", campaignId: String(campaignId) }).catch(() => {});
+    }
+  }
+
+  return c.json({ ok: true, id: messageId });
 });
 
 // ---------- Couple/Family Account Linking ----------

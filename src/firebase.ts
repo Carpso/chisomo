@@ -92,6 +92,8 @@ export function channelForType(type: string | undefined): string {
       return "promotions"; // promotion status
     case "sponsor_desk":
       return "sponsor_desk"; // curated funding opportunities
+    case "chat":
+      return "chat"; // campaign/event chat messages
     case "broadcast":
       return "broadcast"; // admin broadcasts
     case "referral_rewarded":

@@ -277,6 +277,24 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
 8. Re-run migration_v44's app_settings inserts on any fresh DB (already applied to production; the ALTER TABLE part fails on re-run so apply the settings separately)
 
 ## Recent session highlights (0.7.0 hardening pass)
+- **Campaign / event chat (campaign_chat, migration_v47)**: private campaign-scoped
+  conversation between the host and confirmed supporters (donors, ticket holders,
+  RSVPs). `GET/POST /api/campaigns/:id/chat` gate access via
+  `chatCanParticipate` (host/staff always; others must have a confirmed
+  contribution or RSVP → 403 otherwise). Messages store the poster's live
+  `name`/`avatar_url` so bubbles show real user images. New messages push to the
+  campaign's other supporters via the `chat` channel (FCM `channelForType`) and
+  record in-app notifications; 5-message/30s rate limit. Flutter: shared
+  `CampaignChatSection` widget (avatars, host badge, 8s polling, auto-scroll)
+  embedded on both campaign detail and event detail screens; chat pushes tap
+  through to the page. Verified live: post/read/avatar round-trip + access gate.
+- **Non-transactional SMS alerts (off by default)**: master + per-category
+  toggles (`sms_alerts_master`, `sms_alert_milestone/promotion/sponsor_desk/
+  event_reminder/announcement/campaign_ending`) in app_settings. `GET/PUT
+  /api/admin/sms-alerts` (settings scope). `sendAlertSms()` only fires when the
+  master + category are on AND ENV=production (never billed in sandbox); wired
+  into sponsor-desk publish, milestone celebration, promotion live, and event
+  reminders. Flutter: `SmsAlertsConfigCard` in Admin → Tools & settings.
 - **Sponsor Desk host-gated**: `/api/sponsor-desk` now requires an approved host
   (or staff); donors get 401/403. New `POST /api/sponsor-desk/:id/apply` records
   interest (+admin alert); admin create/edit accepts `matchCategories`; the feed
@@ -303,7 +321,7 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
   `recurring_pledges` gains `last_charged_at`/`last_lipila_reference` (migration_v46).
 - **Push notifications overhauled** (like ChurchOnApp): per-category channels
   (`giving_updates`, `events`, `support`, `payments`, `admin`, `promotions`,
-  `sponsor_desk`, `broadcast`, `referrals`, `host`, `links`) — every one
+  `sponsor_desk`, `chat`, `broadcast`, `referrals`, `host`, `links`) — every one
   Importance.max with sound + vibration so alerts ALWAYS pop, never silent.
   Backend `channelForType()` in firebase.ts picks the channel per push type.
   App: content-keyed dedup (30s) + burst coalescing (one summary per channel),
@@ -320,7 +338,10 @@ All applied to remote D1 (v36/v38/v41 were already present from the 0.6.3 deploy
 - **Events never mix with campaigns**: `/api/campaigns` defaults to campaigns
   only; `?type=events` returns events only; search/USSD/share-page exclude
   events; events use their own category set (`EVENT_CATEGORIES`); promoted
-  events render as "Promoted Event" everywhere.
+  events render as "Promoted Event" everywhere. NOTE: the Events tab's big feed
+  reads `eventsProvider` (`?type=events`) while "Recently Opened" reads
+  `campaignViewsProvider` — if a device shows events only in Recently Opened,
+  it's running a stale build from before this separation; rebuild the APK.
 - **Airtime provider layer (pluggable)**: AT does NOT offer airtime for Zambia, so
   `src/airtime.ts` now abstracts suppliers — `manual` (default; admin fulfils by hand +
   `POST /api/admin/airtime-orders/:id/complete`), `mtn_momo` (MTN MoMo API airtime, the
