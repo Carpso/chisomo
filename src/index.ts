@@ -6045,7 +6045,7 @@ app.get("/api/admin/promotions", async (c) => {
   if (!admin) return c.json({ error: "Admin only" }, 403);
 
   const rows = await c.env.DB.prepare(
-    `SELECT p.*, c.title AS campaign_title, u.phone AS host_phone
+    `SELECT p.*, c.title AS campaign_title, c.campaign_type, c.event_tiers, u.phone AS host_phone
      FROM promotions p JOIN campaigns c ON c.id = p.campaign_id JOIN users u ON u.id = c.host_user_id
      ORDER BY p.created_at DESC LIMIT 50`
   ).all<Record<string, any>>();
@@ -6055,6 +6055,7 @@ app.get("/api/admin/promotions", async (c) => {
       id: p.id,
       campaignId: p.campaign_id,
       campaignTitle: p.campaign_title,
+      isEvent: p.campaign_type === "event" || (p.event_tiers != null && p.event_tiers !== ""),
       hostPhone: p.host_phone,
       amountCents: p.amount_cents,
       days: p.days,
