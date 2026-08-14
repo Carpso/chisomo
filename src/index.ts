@@ -783,9 +783,11 @@ async function maybeNotifyMilestones(env: Bindings, campaign: Record<string, any
     }
   }
 
-  // Milestones are push-only (SMS is reserved for transactions + verification).
+  // Milestones push the host (SMS alert optional, toggle off by default).
   await pushToUser(env, campaign.host_user_id, title, body, { type: "milestone", campaignId: String(campaign.id) })
     .catch(() => {});
+  await sendAlertSms(env, "sms_alert_milestone", campaign.host_phone ?? null,
+    `${title}. ${body}`);
 }
 
 /** If the campaign's available balance >= minimum threshold, pay it out to the host immediately. */
@@ -1039,6 +1041,47 @@ async function setSetting(env: Bindings, key: string, value: string): Promise<vo
   ).bind(key, value).run();
 }
 
+// ---------------------------------------------------------------------------
+// Non-transactional SMS alerts (all OFF by default; superadmin/assistants turn
+// them on per category from Admin → Tools & settings → SMS alerts). SMS is
+// otherwise reserved for OTP + transaction confirmations to keep costs minimal.
+// ---------------------------------------------------------------------------
+
+/** Every toggleable non-transactional SMS alert category. */
+const SMS_ALERT_KEYS = [
+  "sms_alert_milestone",        // campaign milestone celebration
+  "sms_alert_promotion",        // promotion active/approved
+  "sms_alert_sponsor_desk",     // new Sponsor Desk opportunities
+  "sms_alert_event_reminder",   // 48h / 2h event countdown
+  "sms_alert_announcement",     // host update published
+  "sms_alert_campaign_ending",  // campaign ends soon
+] as const;
+
+/** True only when the master SMS-alerts switch AND this category are on. */
+async function smsAlertEnabled(env: Bindings, key: string): Promise<boolean> {
+  if ((await getSetting(env, "sms_alerts_master")) !== "true") return false;
+  return (await getSetting(env, key)) === "true";
+}
+
+/** Sends a non-transactional alert SMS only if its toggle + master are ON and
+ *  we're in production (never billed in sandbox). Fire-and-forget: a failure
+ *  here must never break the caller. Text is clamped to one SMS unit. */
+async function sendAlertSms(env: Bindings, key: string, phone: string | null, text: string): Promise<void> {
+  if (!phone) return;
+  if (env.ENV !== "production") return;
+  if (!(await smsAlertEnabled(env, key))) return;
+  await sendSms(env, phone, `KSPONSOR: ${text}`)
+    .catch((e) => console.error(`[alert-sms ${key}] failed:`, e));
+}
+
+/** Full SMS-alerts config (master + every category). */
+async function smsAlertConfig(env: Bindings): Promise<Record<string, boolean>> {
+  const master = (await getSetting(env, "sms_alerts_master")) === "true";
+  const out: Record<string, boolean> = { master };
+  for (const key of SMS_ALERT_KEYS) out[key] = (await getSetting(env, key)) === "true";
+  return out;
+}
+
 /** Display name of the support assistant used as signature/greeting in replies. */
 async function supportAssistantName(env: Bindings): Promise<string> {
   return (await getSetting(env, "support_assistant_name")) ?? "Kingdom Sponsor Care Team";
@@ -1124,6 +1167,8 @@ async function approvePromotion(env: Bindings, promoId: number): Promise<void> {
     await pushOnly(env, campaign.host_user_id, "Your campaign is promoted",
       `"${campaign.title}" is now at the top of Kingdom Sponsor for ${days} days.`,
       { type: "promotion_active", campaignId: String(campaign.id) });
+    await sendAlertSms(env, "sms_alert_promotion", campaign.host_phone ?? null,
+      `Your campaign "${campaign.title}" is promoted at the top for ${days} days.`);
   }
 }
 
@@ -1362,6 +1407,9 @@ async function runEventReminders(env: Bindings): Promise<void> {
           { type: "event_reminder", campaignId: String(ev.id), when: fire2 ? "2h" : "48h" })
           .catch((e) => console.error("event host reminder failed:", e));
       }
+      // Optional host SMS alert (toggle off by default).
+      await sendAlertSms(env, "sms_alert_event_reminder", ev.host_phone,
+        `${fire2 ? "Your event starts in 2 hours" : "Your event is in 2 days"}: "${ev.title}" on ${startLabel}.`);
     }
 
     await env.DB.prepare(
@@ -5697,6 +5745,28 @@ app.put("/api/admin/milestone-config", async (c) => {
   return c.json({ ok: true, thresholds: sorted });
 });
 
+/** Admin: non-transactional SMS alerts config (all off by default). */
+app.get("/api/admin/sms-alerts", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  return c.json({ config: await smsAlertConfig(c.env) });
+});
+
+app.put("/api/admin/sms-alerts", async (c) => {
+  const admin = await requireStaff(c, "settings");
+  if (!admin) return c.json({ error: "Admin only" }, 403);
+  const body = await c.req.json();
+  if (typeof body.master === "boolean") {
+    await setSetting(c.env, "sms_alerts_master", body.master ? "true" : "false");
+  }
+  for (const key of SMS_ALERT_KEYS) {
+    if (typeof body[key] === "boolean") {
+      await setSetting(c.env, key, body[key] ? "true" : "false");
+    }
+  }
+  return c.json({ ok: true, config: await smsAlertConfig(c.env) });
+});
+
 /** Admin: set or clear the per-event platform-fee waiver. */
 app.put("/api/admin/campaigns/:id/waive-event-fees", async (c) => {
   const admin = await requireStaff(c, "campaigns");
@@ -7895,6 +7965,9 @@ app.post("/api/admin/sponsor-desk/publish", async (c) => {
     if (result.failedTokens.length) await pruneInvalidTokens(c.env, result.failedTokens);
     await recordNotification(c.env, host.id, "sponsor_desk", title,
       `${picked.length} new grant/empowerment opportunities are on your Sponsor Desk.`, { type: "sponsor_desk" });
+    // Optional SMS alert (toggle off by default).
+    await sendAlertSms(c.env, "sms_alert_sponsor_desk", host.phone,
+      `${picked.length} new funding opportunities on your Sponsor Desk. Open the app to apply.`);
   }
   // Let the team know the batch went out (and who published it).
   await pushAdmins(c.env, "Sponsor Desk published",
